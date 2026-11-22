@@ -16,6 +16,7 @@ package logservice
 
 import (
 	"context"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -38,6 +39,7 @@ func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 	for i := range configs {
 		configs[i] = getServiceTestConfig()
 		configs[i].DataDir = t.TempDir()
+		configs[i].SnapshotExportDir = filepath.Join(configs[i].DataDir, "exported-snapshot")
 		configs[i].FS = vfs.Default
 		configs[i].LogDBDisablePrealloc = true
 		configs[i].RPC.MaxMessageSize = DefaultConfig().RPC.MaxMessageSize
@@ -166,6 +168,7 @@ func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 	beforeRemove := readMembership(a, 1)
 	require.NoError(t, a.store.nh.SyncRequestDeleteReplica(ctx, 1, 3, beforeRemove.ConfigChangeID))
 	configs[2].DataDir = t.TempDir()
+	configs[2].SnapshotExportDir = filepath.Join(configs[2].DataDir, "exported-snapshot")
 	open(2)
 	c = services[2]
 	require.Eventually(t, func() bool {
@@ -232,6 +235,7 @@ func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 func TestNonVotingStartChecksIdentityAndReopensDisk(t *testing.T) {
 	cfg := getServiceTestConfig()
 	cfg.DataDir = t.TempDir()
+	cfg.SnapshotExportDir = filepath.Join(cfg.DataDir, "exported-snapshot")
 	cfg.FS = vfs.Default
 	cfg.LogDBDisablePrealloc = true
 	var service *Service
