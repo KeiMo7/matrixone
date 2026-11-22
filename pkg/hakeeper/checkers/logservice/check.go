@@ -87,8 +87,20 @@ type operatorChecker interface {
 }
 
 type checker struct {
-	lc *logServiceChecker
-	ss []*stats
+	lc                  *logServiceChecker
+	ss                  []*stats
+	membershipScheduled map[uint64]struct{}
+	removing            map[operator.Replica]bool
+}
+
+func (c checker) membershipChangeInFlight(shardID uint64) bool {
+	if _, ok := c.membershipScheduled[shardID]; ok {
+		return true
+	}
+	return len(c.lc.executing.Adding[shardID]) > 0 ||
+		len(c.lc.executing.Removing[shardID]) > 0 ||
+		len(c.lc.executingNonVoting.Adding[shardID]) > 0 ||
+		len(c.lc.executingNonVoting.Removing[shardID]) > 0
 }
 
 // checkToBootstrap is different with checkToAdd. checkToBootstrap checks
@@ -204,77 +216,80 @@ func (ca *checkToAdd) check() []*operator.Operator {
 			uuid string,
 			shardInfo pb.LogShardInfo,
 			replicaID uint64,
+			executorCandidates []string,
 		) (*operator.Operator, error),
+		changeType pb.ConfigChangeType,
 		locality pb.Locality,
 	) {
-		for shardID, replicasToAdd := range toAdd {
-			numOfLogReplicas := getNumOfLogReplicas(
-				ca.lc.Cluster.LogShards,
-				shardID,
-			)
-			// Cannot get the number of log replicas, do nothing.
-			if numOfLogReplicas == 0 {
+		shardIDs := make([]uint64, 0, len(toAdd))
+		for shardID := range toAdd {
+			shardIDs = append(shardIDs, shardID)
+		}
+		slices.Sort(shardIDs)
+		for _, shardID := range shardIDs {
+			if ca.membershipChangeInFlight(shardID) {
 				continue
 			}
-
-			// Check if the number of toAdd replicas equals to number of log
-			// replicas in config. If it is true, should bootstrap the replicas
-			// but not add replicas.
-			if uint64(normalStats.toAdd[shardID]) == numOfLogReplicas {
+			replicasToAdd := toAdd[shardID]
+			numOfLogReplicas := getNumOfLogReplicas(ca.lc.Cluster.LogShards, shardID)
+			if numOfLogReplicas == 0 || uint64(normalStats.toAdd[shardID]) == numOfLogReplicas {
 				continue
 			}
-
-			working := deepcopy.Copy(ca.lc.workingStores).(map[string]pb.Locality)
-			for replicasToAdd > uint32(len(adding[shardID])) {
-				bestStore := selectStore(
-					ca.lc.logState.Shards[shardID],
-					ca.lc.workingStores,
-					locality,
-				)
-				if bestStore == "" {
-					runtime.ServiceRuntime(ca.lc.ServiceID).Logger().Error(
-						"cannot get store for adding replica",
-						zap.Uint64("shardID", shardID),
-					)
-					break
-				}
-				newReplicaID, ok := ca.lc.Alloc.Next()
-				if !ok {
-					runtime.ServiceRuntime(ca.lc.ServiceID).Logger().Error(
-						"cannot alloc new replica ID",
-						zap.Uint64("shardID", shardID),
-					)
-					return
-				}
-				if op, err := createFn(
-					bestStore,
-					ca.lc.logState.Shards[shardID],
-					newReplicaID,
-				); err != nil {
-					runtime.ServiceRuntime(ca.lc.ServiceID).Logger().Error(
-						"create add replica operator failed", zap.Error(err))
-					// may be no more stores, skip this shard
-					break
-				} else {
-					ops = append(ops, op)
-					replicasToAdd--
-					delete(working, bestStore)
-				}
+			shardInfo := ca.lc.logState.Shards[shardID]
+			if replicasToAdd <= uint32(len(adding[shardID])) {
+				continue
 			}
+			bestStore := selectStore(shardInfo, ca.lc.workingStores, locality)
+			if bestStore == "" {
+				runtime.ServiceRuntime(ca.lc.ServiceID).Logger().Error(
+					"cannot get store for adding replica", zap.Uint64("shardID", shardID))
+				continue
+			}
+			// Replica ID 0 is reserved by Dragonboat. Check the target and both
+			// majorities before allocating a real ID for an executable change.
+			executorCandidates := hakeeper.LogMembershipTargets(ca.lc.Cfg, ca.lc.logState, ca.lc.CurrentTick, changeType,
+				pb.Replica{UUID: bestStore, ShardID: shardID, Epoch: shardInfo.Epoch})
+			if len(executorCandidates) == 0 {
+				continue
+			}
+			newReplicaID, ok := ca.lc.Alloc.Next()
+			if !ok {
+				runtime.ServiceRuntime(ca.lc.ServiceID).Logger().Error(
+					"cannot alloc new replica ID", zap.Uint64("shardID", shardID))
+				return
+			}
+			op, err := createFn(bestStore, shardInfo, newReplicaID, executorCandidates)
+			if err != nil {
+				runtime.ServiceRuntime(ca.lc.ServiceID).Logger().Error(
+					"create add replica operator failed", zap.Error(err))
+				continue
+			}
+			ops = append(ops, op)
+			if ca.membershipScheduled == nil {
+				ca.membershipScheduled = make(map[uint64]struct{})
+			}
+			ca.membershipScheduled[shardID] = struct{}{}
 		}
 	}
 
 	for _, s := range ca.ss {
-		fn := operator.CreateAddReplica
+		fn := func(uuid string, shardInfo pb.LogShardInfo, replicaID uint64, candidates []string) (*operator.Operator, error) {
+			return operator.CreateAddReplicaWithCandidates(uuid, shardInfo, replicaID, candidates)
+		}
 		locality := pb.Locality{}
+		changeType := pb.AddReplica
 		adding := ca.lc.executing.Adding
 		if s.nonVoting {
-			fn = operator.CreateAddNonVotingReplica
+			fn = func(uuid string, shardInfo pb.LogShardInfo, replicaID uint64, candidates []string) (*operator.Operator, error) {
+				return operator.CreateAddNonVotingReplicaWithCandidates(uuid, shardInfo, replicaID, candidates)
+			}
 			adding = ca.lc.executingNonVoting.Adding
 			locality = ca.lc.nonVotingLocality
+			changeType = pb.AddNonVotingReplica
 		}
-		checkFn(s.toAdd, adding, fn, locality)
+		checkFn(s.toAdd, adding, fn, changeType, locality)
 	}
+
 	return ops
 }
 
@@ -287,39 +302,69 @@ func (cr *checkToRemove) check() []*operator.Operator {
 	checkFn := func(
 		toRemove map[uint64][]replica,
 		removing map[uint64][]uint64,
-		createFn func(
-			uuid string,
-			shardInfo pb.LogShardInfo,
-		) (*operator.Operator, error),
+		changeType pb.ConfigChangeType,
+		createFn func(uuid string, shardInfo pb.LogShardInfo, executorCandidates []string) (*operator.Operator, error),
 	) {
-		for shardID, replicasToRemove := range toRemove {
+		shardIDs := make([]uint64, 0, len(toRemove))
+		for shardID := range toRemove {
+			shardIDs = append(shardIDs, shardID)
+		}
+		slices.Sort(shardIDs)
+		for _, shardID := range shardIDs {
+			if cr.membershipChangeInFlight(shardID) {
+				continue
+			}
+			replicasToRemove := toRemove[shardID]
+			shardInfo := cr.lc.logState.Shards[shardID]
+			if changeType == pb.RemoveNonVotingReplica {
+				slices.SortFunc(replicasToRemove, func(a, b replica) int {
+					return cmp.Compare(a.replicaID, b.replicaID)
+				})
+			}
 			for _, toRemoveReplica := range replicasToRemove {
 				if contains(removing[shardID], toRemoveReplica.replicaID) {
 					continue
 				}
-				if op, err := createFn(
-					toRemoveReplica.uuid,
-					cr.lc.logState.Shards[toRemoveReplica.shardID],
-				); err != nil {
+				executorCandidates := hakeeper.LogMembershipTargets(cr.lc.Cfg, cr.lc.logState, cr.lc.CurrentTick, changeType,
+					pb.Replica{UUID: toRemoveReplica.uuid, ShardID: shardID, ReplicaID: toRemoveReplica.replicaID, Epoch: shardInfo.Epoch})
+				if len(executorCandidates) == 0 {
+					continue
+				}
+				op, err := createFn(toRemoveReplica.uuid, shardInfo, executorCandidates)
+				if err != nil {
 					runtime.ServiceRuntime(cr.lc.ServiceID).Logger().Error(
 						"create remove replica operator failed", zap.Error(err))
-					// skip this replica
 					continue
-				} else {
-					ops = append(ops, op)
 				}
+				ops = append(ops, op)
+				if cr.membershipScheduled == nil {
+					cr.membershipScheduled = make(map[uint64]struct{})
+				}
+				cr.membershipScheduled[shardID] = struct{}{}
+				if cr.removing == nil {
+					cr.removing = make(map[operator.Replica]bool)
+				}
+				cr.removing[operator.Replica{UUID: toRemoveReplica.uuid, ShardID: shardID, ReplicaID: toRemoveReplica.replicaID}] = true
+				break
 			}
 		}
 	}
 	for _, s := range cr.ss {
-		fn := operator.CreateRemoveReplica
-		removing := cr.lc.executing.Removing
-		if s.nonVoting {
-			fn = operator.CreateRemoveNonVotingReplica
-			removing = cr.lc.executingNonVoting.Removing
+		fn := func(uuid string, shardInfo pb.LogShardInfo, candidates []string) (*operator.Operator, error) {
+			return operator.CreateRemoveReplicaWithCandidates(uuid, shardInfo, candidates)
 		}
-		checkFn(s.toRemove, removing, fn)
+		removing := cr.lc.executing.Removing
+		changeType := pb.RemoveReplica
+		if s.nonVoting {
+			fn = func(uuid string, shardInfo pb.LogShardInfo, candidates []string) (*operator.Operator, error) {
+				return operator.CreateRemoveNonVotingReplicaWithCandidates(uuid, shardInfo, candidates)
+			}
+			removing = cr.lc.executingNonVoting.Removing
+			changeType = pb.RemoveNonVotingReplica
+		}
+		checkFn(s.toRemove, removing, changeType, fn)
 	}
+
 	return ops
 }
 
@@ -336,6 +381,11 @@ func (cs *checkToStart) check() []*operator.Operator {
 	) {
 		for _, replicaToStart := range toStart {
 			if contains(starting[replicaToStart.shardID], replicaToStart.replicaID) {
+				continue
+			}
+			key := operator.Replica{UUID: replicaToStart.uuid, ShardID: replicaToStart.shardID, ReplicaID: replicaToStart.replicaID}
+			if cs.removing[key] || contains(cs.lc.executing.Removing[key.ShardID], key.ReplicaID) ||
+				contains(cs.lc.executingNonVoting.Removing[key.ShardID], key.ReplicaID) {
 				continue
 			}
 			ops = append(ops, createFn(
@@ -464,16 +514,15 @@ func (c *logServiceChecker) Check() (operators []*operator.Operator) {
 		c.nonVotingReplicaNum,
 	)
 	commonChecker := checker{
-		lc: c,
-		ss: []*stats{
-			normalStats,
-			nonVotingStats,
-		},
+		lc:                  c,
+		ss:                  []*stats{normalStats, nonVotingStats},
+		membershipScheduled: make(map[uint64]struct{}),
+		removing:            make(map[operator.Replica]bool),
 	}
 	checkers := []operatorChecker{
 		&checkToBootstrap{checker: commonChecker},
-		&checkToAdd{checker: commonChecker},
 		&checkToRemove{checker: commonChecker},
+		&checkToAdd{checker: commonChecker},
 		&checkToStart{checker: commonChecker},
 		&checkZombie{checker: commonChecker},
 		&checkTaskService{checker: commonChecker},

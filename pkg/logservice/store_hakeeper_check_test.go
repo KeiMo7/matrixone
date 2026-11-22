@@ -250,6 +250,20 @@ func runHakeeperTaskServiceTest(t *testing.T, fn func(*testing.T, *store, taskse
 	fn(t, store, taskService)
 }
 
+type localScheduleStateClient struct {
+	LogHAKeeperClient
+	store *store
+}
+
+func (c *localScheduleStateClient) Close() error { return nil }
+
+func (c *localScheduleStateClient) GetLogScheduleState(ctx context.Context, shard uint64, target string, reports bool) (pb.CheckerState, error) {
+	state, err := c.store.readCheckerState(ctx, &hakeeper.StateQuery{LogSchedule: &pb.LogScheduleQuery{
+		ShardID: shard, TargetStore: target, IncludeReports: reports,
+	}})
+	return *state, err
+}
+
 func runHAKeeperClusterTest(t *testing.T, fn func(*testing.T, []*Service)) {
 	runtime.RunTest(
 		"",
@@ -466,13 +480,15 @@ func TestHAKeeperCanBootstrapAndRepairShards(t *testing.T) {
 		require.NotNil(t, leaderStore.bootstrapMgr)
 		assert.False(t, leaderStore.bootstrapMgr.CheckBootstrap(state.LogState))
 
-		// get and apply all bootstrap schedule commands
+		// Exercise bootstrap through the same validation and execution path as
+		// heartbeat-delivered commands, even though workers are disabled here.
+		for _, service := range services {
+			service.haClient = &localScheduleStateClient{store: leaderStore}
+		}
 		for _, s := range services[:3] {
 			cb, err := s.store.getCommandBatch(ctx, s.store.id())
 			require.NoError(t, err)
-			if len(cb.Commands) > 0 {
-				s.handleStartReplica(cb.Commands[0])
-			}
+			s.handleCommands(ctx, cb.Commands)
 		}
 
 		// check bootstrap can be completed
@@ -523,6 +539,11 @@ func TestHAKeeperCanBootstrapAndRepairShards(t *testing.T) {
 		// no service.Close can be repeatedly called
 		services[0].store = nil
 		services = services[1:]
+		// The fixture disables background workers. Read the real HAKeeper state
+		// through a surviving store when applying delivered commands.
+		for _, service := range services {
+			service.haClient = &localScheduleStateClient{store: services[0].store}
+		}
 
 		// wait for HAKeeper to repair the Log & HAKeeper shards
 		tnRepaired := false
@@ -535,19 +556,19 @@ func TestHAKeeperCanBootstrapAndRepairShards(t *testing.T) {
 				if cb, err := services[0].store.addLogStoreHeartbeat(ctx, m); err != nil {
 					return false, err
 				} else {
-					services[0].handleCommands(cb.Commands)
+					services[0].handleCommands(ctx, cb.Commands)
 				}
 				m = services[1].store.getHeartbeatMessage()
 				if cb, err := services[1].store.addLogStoreHeartbeat(ctx, m); err != nil {
 					return false, err
 				} else {
-					services[1].handleCommands(cb.Commands)
+					services[1].handleCommands(ctx, cb.Commands)
 				}
 				m = services[2].store.getHeartbeatMessage()
 				if cb, err := services[0].store.addLogStoreHeartbeat(ctx, m); err != nil {
 					return false, err
 				} else {
-					services[2].handleCommands(cb.Commands)
+					services[2].handleCommands(ctx, cb.Commands)
 				}
 				if _, err := services[0].store.addTNStoreHeartbeat(ctx, tnMsg2); err != nil {
 					return false, err

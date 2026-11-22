@@ -22,7 +22,6 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/hakeeper/checkers/cnservice"
 	"github.com/matrixorigin/matrixone/pkg/hakeeper/checkers/logservice"
 	"github.com/matrixorigin/matrixone/pkg/hakeeper/checkers/proxy"
-	"github.com/matrixorigin/matrixone/pkg/hakeeper/checkers/syshealth"
 	"github.com/matrixorigin/matrixone/pkg/hakeeper/checkers/tnservice"
 	"github.com/matrixorigin/matrixone/pkg/hakeeper/checkers/util"
 	"github.com/matrixorigin/matrixone/pkg/hakeeper/operator"
@@ -33,11 +32,6 @@ import (
 // Coordinator is assumed to be used in synchronous, single-threaded context.
 type Coordinator struct {
 	OperatorController *operator.Controller
-
-	// Considering the context of `Coordinator`,
-	// there is no need for a mutext to protect.
-	teardown    bool
-	teardownOps []*operator.Operator
 
 	service string
 	cfg     hakeeper.Config
@@ -71,42 +65,8 @@ func (c *Coordinator) Check(alloc util.IDAllocator, state pb.CheckerState, stand
 		zap.Uint64("current tick", currentTick),
 	)
 
-	defer func() {
-		if !c.teardown {
-			runtime.ServiceRuntime(c.service).Logger().Debug("MO is working.")
-		}
-	}()
-
 	c.OperatorController.RemoveFinishedOperator(logState, tnState, cnState, proxyState)
 
-	// if we've discovered unhealthy already, no need to keep alive anymore.
-	if c.teardown {
-		return c.OperatorController.Dispatch(c.teardownOps, logState, tnState, cnState, proxyState)
-	}
-
-	// check whether system health or not.
-	if operators, health := syshealth.Check(c.cfg, cluster, tnState, logState, currentTick); !health {
-		// TN starts have a report/target lifetime. Teardown ends their ownership
-		// before ordinary checks stop running.
-		for _, record := range cluster.TNShards {
-			for _, op := range slices.Clone(c.OperatorController.GetOperators(record.ShardID)) {
-				if steps := op.OpSteps(); len(steps) == 1 {
-					if _, ok := steps[0].(operator.AddTnReplica); ok {
-						c.OperatorController.RemoveOperator(op)
-					}
-				}
-			}
-		}
-		c.teardown = true
-		c.teardownOps = operators
-		return c.OperatorController.Dispatch(c.teardownOps, logState, tnState, cnState, proxyState)
-	}
-
-	// system health, try to keep alive.
-	executing := c.OperatorController.GetExecutingReplicas()
-	executingNonVoting := c.OperatorController.GetNonVotingExecutingReplicas()
-
-	operators := make([]*operator.Operator, 0)
 	commonFields := hakeeper.NewCheckerCommonFields(
 		c.service,
 		c.cfg,
@@ -115,6 +75,11 @@ func (c *Coordinator) Check(alloc util.IDAllocator, state pb.CheckerState, stand
 		user,
 		currentTick,
 	)
+	c.removeStaleLogMembershipOperators(state)
+	executing := c.OperatorController.GetExecutingReplicas()
+	executingNonVoting := c.OperatorController.GetNonVotingExecutingReplicas()
+
+	operators := make([]*operator.Operator, 0)
 	checkers := []hakeeper.ModuleChecker{
 		logservice.NewLogServiceChecker(
 			commonFields,
@@ -145,8 +110,46 @@ func (c *Coordinator) Check(alloc util.IDAllocator, state pb.CheckerState, stand
 		for _, shardID := range slices.Compact(shardIDs) {
 			existing = append(existing, c.OperatorController.GetOperators(shardID)...)
 		}
-		pending := logservice.PendingOperators(commonFields, logState, state.NonVotingReplicaNum, existing)
+		pending := logservice.PendingOperators(commonFields, logState, state.NonVotingReplicaNum, existing, operators)
 		operators = append(pending, operators...)
 	}
 	return c.OperatorController.Dispatch(operators, logState, tnState, cnState, proxyState)
+}
+
+func (c *Coordinator) removeStaleLogMembershipOperators(state pb.CheckerState) {
+	var stale []*operator.Operator
+	for shardID := range state.LogState.Shards {
+		for _, op := range c.OperatorController.GetOperators(shardID) {
+			step := op.Check(state.LogState, state.TNState, state.CNState, state.ProxyState)
+			if step == nil || op.IsEnd() {
+				continue
+			}
+			replica, target, change, ok := logMembershipStep(step)
+			if !ok {
+				continue
+			}
+			member := pb.Replica{UUID: replica.UUID, ShardID: replica.ShardID, ReplicaID: replica.ReplicaID, Epoch: replica.Epoch}
+			if !slices.Contains(hakeeper.LogMembershipTargets(c.cfg, state.LogState, state.Tick, change, member), target) {
+				stale = append(stale, op)
+			}
+		}
+	}
+	for _, op := range stale {
+		c.OperatorController.RemoveOperator(op)
+	}
+}
+
+func logMembershipStep(step operator.OpStep) (operator.Replica, string, pb.ConfigChangeType, bool) {
+	switch step := step.(type) {
+	case operator.AddLogService:
+		return step.Replica, step.Target, pb.AddReplica, true
+	case operator.AddNonVotingLogService:
+		return step.Replica, step.Target, pb.AddNonVotingReplica, true
+	case operator.RemoveLogService:
+		return step.Replica, step.Target, pb.RemoveReplica, true
+	case operator.RemoveNonVotingLogService:
+		return step.Replica, step.Target, pb.RemoveNonVotingReplica, true
+	default:
+		return operator.Replica{}, "", 0, false
+	}
 }

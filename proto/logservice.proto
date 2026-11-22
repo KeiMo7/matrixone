@@ -343,7 +343,15 @@ message Request {
   uint64 NonVotingReplicaNum     = 14;
   Locality NonVotingLocality     = 15;
   CheckHealth CheckHealth        = 16;
+  LogScheduleQuery LogScheduleQuery = 17;
 };
+
+// A bounded read-only view used to validate one LogStore scheduling command.
+message LogScheduleQuery {
+  uint64 ShardID = 1;
+  string TargetStore = 2;
+  bool IncludeReports = 3;
+}
 
 message LogResponse {
   uint64 ShardID      = 1;

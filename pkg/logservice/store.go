@@ -525,13 +525,11 @@ func (l *store) startNonVotingReplica(shardID uint64, replicaID uint64,
 }
 
 func (l *store) stopReplica(shardID uint64, replicaID uint64) error {
-	if shardID == hakeeper.DefaultHAKeeperShardID {
-		defer func() {
-			atomic.StoreUint64(&l.haKeeperReplicaID, 0)
-		}()
-	}
 	if err := l.nh.StopReplica(shardID, replicaID); err != nil {
 		return err
+	}
+	if shardID == hakeeper.DefaultHAKeeperShardID {
+		atomic.CompareAndSwapUint64(&l.haKeeperReplicaID, replicaID, 0)
 	}
 	if l.onReplicaChanged != nil {
 		l.onReplicaChanged(shardID, replicaID, DelReplica)

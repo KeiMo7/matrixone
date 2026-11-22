@@ -87,6 +87,8 @@ type TNHAKeeperClient interface {
 // LogHAKeeperClient is the HAKeeper client used by a Log store.
 type LogHAKeeperClient interface {
 	basicHAKeeperClient
+	// GetLogScheduleState reads the bounded state needed to validate one command.
+	GetLogScheduleState(ctx context.Context, shardID uint64, targetStore string, includeReports bool) (pb.CheckerState, error)
 	// SendLogHeartbeat sends the specified heartbeat message to the HAKeeper. The
 	// returned CommandBatch contains Schedule Commands to be executed by the local
 	// Log store.
@@ -449,6 +451,14 @@ func (c *managedHAKeeperClient) GetClusterDetails(ctx context.Context) (pb.Clust
 }
 
 func (c *managedHAKeeperClient) GetClusterState(ctx context.Context) (pb.CheckerState, error) {
+	return c.getCheckerState(ctx, nil)
+}
+
+func (c *managedHAKeeperClient) GetLogScheduleState(ctx context.Context, shardID uint64, targetStore string, includeReports bool) (pb.CheckerState, error) {
+	return c.getCheckerState(ctx, &pb.LogScheduleQuery{ShardID: shardID, TargetStore: targetStore, IncludeReports: includeReports})
+}
+
+func (c *managedHAKeeperClient) getCheckerState(ctx context.Context, query *pb.LogScheduleQuery) (pb.CheckerState, error) {
 	if err := validateHAKeeperClientContext(ctx); err != nil {
 		return pb.CheckerState{}, err
 	}
@@ -463,7 +473,7 @@ func (c *managedHAKeeperClient) GetClusterState(ctx context.Context) (pb.Checker
 			}
 			return pb.CheckerState{}, err
 		}
-		s, err := client.getClusterState(ctx)
+		s, err := client.getCheckerState(ctx, query)
 		if shouldResetHAKeeperClient(err) {
 			if resetErr := c.resetClientIfCurrent(client); resetErr != nil {
 				return pb.CheckerState{}, err
@@ -1395,8 +1405,13 @@ func (c *hakeeperClient) getClusterDetails(ctx context.Context) (pb.ClusterDetai
 }
 
 func (c *hakeeperClient) getClusterState(ctx context.Context) (pb.CheckerState, error) {
+	return c.getCheckerState(ctx, nil)
+}
+
+func (c *hakeeperClient) getCheckerState(ctx context.Context, query *pb.LogScheduleQuery) (pb.CheckerState, error) {
 	req := pb.Request{
-		Method: pb.GET_CLUSTER_STATE,
+		Method:           pb.GET_CLUSTER_STATE,
+		LogScheduleQuery: query,
 	}
 	resp, err := c.request(ctx, req)
 	if err != nil {

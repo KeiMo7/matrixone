@@ -1213,6 +1213,7 @@ func TestCheck(t *testing.T) {
 
 	for i, c := range cases {
 		fmt.Printf("case %v: %s\n", i, c.desc)
+		fixLegacyFixtureReports(c.logState)
 		alloc := util.NewTestIDAllocator(c.idStartFrom)
 		cfg := hakeeper.Config{}
 		cfg.Fill()
@@ -1239,7 +1240,9 @@ func TestCheck(t *testing.T) {
 		)
 		operators := lc.Check()
 
-		assert.Equal(t, len(c.expected), len(operators))
+		if !assert.Equal(t, len(c.expected), len(operators)) {
+			continue
+		}
 		for j, op := range operators {
 			assert.Equal(t, len(c.expected[j].OpSteps()), len(op.OpSteps()))
 			for k, step := range op.OpSteps() {
@@ -1247,4 +1250,57 @@ func TestCheck(t *testing.T) {
 			}
 		}
 	}
+}
+
+// The older table fixtures describe running members by shard only.
+func fixLegacyFixtureReports(state pb.LogState) {
+	for uuid, store := range state.Stores {
+		for i := range store.Replicas {
+			r := &store.Replicas[i]
+			shard := state.Shards[r.ShardID]
+			for id, member := range shard.Replicas {
+				if member == uuid {
+					r.ReplicaID, r.IsNonVoting = id, false
+				}
+			}
+			for id, member := range shard.NonVotingReplicas {
+				if member == uuid {
+					r.ReplicaID, r.IsNonVoting = id, true
+				}
+			}
+		}
+		state.Stores[uuid] = store
+	}
+}
+
+func TestCheckerDoesNotStartSelectedSurplusRemoval(t *testing.T) {
+	cfg := hakeeper.Config{}
+	cfg.Fill()
+	shard := pb.LogShardInfo{ShardID: 1, Epoch: 7, LeaderID: 1,
+		Replicas: map[uint64]string{1: "a", 2: "b", 3: "c", 4: "d", 5: "e"}}
+	state := pb.LogState{Shards: map[uint64]pb.LogShardInfo{1: shard}, Stores: map[string]pb.LogStoreInfo{}}
+	for id, uuid := range shard.Replicas {
+		store := pb.LogStoreInfo{Tick: 1}
+		if id <= 3 {
+			store.Replicas = []pb.LogReplicaInfo{{LogShardInfo: shard, ReplicaID: id}}
+		}
+		state.Stores[uuid] = store
+	}
+	fields := hakeeper.NewCheckerCommonFields("", cfg, util.NewTestIDAllocator(100),
+		pb.ClusterInfo{LogShards: []metadata.LogShardRecord{{ShardID: 1, NumberOfReplicas: 3}}}, pb.TaskTableUser{}, 1)
+	checker := NewLogServiceChecker(fields, state, pb.TNState{}, operator.ExecutingReplicas{},
+		operator.ExecutingReplicas{}, 0, pb.Locality{}, false)
+	var removed, started []uint64
+	for _, op := range checker.Check() {
+		for _, step := range op.OpSteps() {
+			switch step := step.(type) {
+			case operator.RemoveLogService:
+				removed = append(removed, step.ReplicaID)
+			case operator.StartLogService:
+				started = append(started, step.ReplicaID)
+			}
+		}
+	}
+	assert.Equal(t, []uint64{4}, removed)
+	assert.Equal(t, []uint64{5}, started)
 }

@@ -16,8 +16,10 @@ package logservice
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"time"
 
 	"go.uber.org/zap"
@@ -29,24 +31,41 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/util/trace"
 )
 
-func (s *Service) handleCommands(cmds []pb.ScheduleCommand) {
+func (s *Service) handleCommands(ctx context.Context, cmds []pb.ScheduleCommand) {
+	// StopReplica only initiates asynchronous Raft offload. Defer queued
+	// non-bootstrap starts for the same shard in this heartbeat batch.
+	stopping := make(map[uint64]struct{})
 	for _, cmd := range cmds {
+		if change := cmd.GetConfigChange(); change != nil {
+			switch change.ChangeType {
+			case pb.StopReplica, pb.StopNonVotingReplica, pb.KillZombie:
+				stopping[change.Replica.ShardID] = struct{}{}
+			}
+		}
+	}
+	// Bootstrap commands carry an initial membership and follow the existing
+	// bootstrap delivery protocol, including one-shot dynamic bootstrap.
+	validation := scheduleValidation{remaining: time.Second}
+	for _, cmd := range cmds {
+		change := cmd.GetConfigChange()
+		if cmd.BootstrapShard != nil {
+			s.handleBootstrapShard(cmd)
+			continue
+		}
+		if cmd.Bootstrapping && change != nil && change.ChangeType == pb.StartReplica {
+			s.handleStartReplica(cmd)
+			continue
+		}
+		if change != nil && (isMembershipChange(change) || change.ChangeType == pb.StartReplica || change.ChangeType == pb.StartNonVotingReplica) {
+			if !s.pendingSchedule.add(cmd) {
+				s.runtime.Logger().Warn("schedule command queue full; relying on HAKeeper retry", zap.String("command", cmd.LogString()))
+			}
+			continue
+		}
 		s.runtime.Logger().Info(fmt.Sprintf("%s applying cmd: %s", s.ID(), cmd.LogString()))
-		if cmd.GetConfigChange() != nil {
+		if change != nil {
 			s.runtime.Logger().Debug("applying schedule command:", zap.String("command", cmd.LogString()))
 			switch cmd.ConfigChange.ChangeType {
-			case pb.AddReplica:
-				s.handleAddReplica(cmd)
-			case pb.AddNonVotingReplica:
-				s.handleAddNonVotingReplica(cmd)
-			case pb.RemoveReplica:
-				s.handleRemoveReplica(cmd)
-			case pb.RemoveNonVotingReplica:
-				s.handleRemoveReplica(cmd)
-			case pb.StartReplica:
-				s.handleStartReplica(cmd)
-			case pb.StartNonVotingReplica:
-				s.handleStartNonVotingReplica(cmd)
 			case pb.StopReplica:
 				s.handleStopReplica(cmd)
 			case pb.StopNonVotingReplica:
@@ -57,18 +76,118 @@ func (s *Service) handleCommands(cmds []pb.ScheduleCommand) {
 				panic(fmt.Sprintf("unknown config change cmd type %d", cmd.ConfigChange.ChangeType))
 			}
 		} else if cmd.GetShutdownStore() != nil {
-			s.handleShutdownStore(cmd)
+			// Ignore historical global shutdowns without dropping other commands.
+			continue
 		} else if cmd.GetCreateTaskService() != nil {
 			s.createTaskService(cmd.CreateTaskService)
 			s.createSQLLogger(cmd.CreateTaskService)
 		} else if cmd.GetAddLogShard() != nil {
 			s.handleAddLogShard(cmd)
-		} else if cmd.GetBootstrapShard() != nil {
-			s.handleBootstrapShard(cmd)
 		} else {
 			panic(fmt.Sprintf("unknown schedule command type: %+v", cmd))
 		}
 	}
+
+	// Bound admission of work per heartbeat, while giving each read its own
+	// deadline. A failed read rotates to avoid starving unrelated shards.
+	for remaining := len(s.pendingSchedule.items); remaining > 0 && len(s.pendingSchedule.items) > 0 && !validation.exhausted() && ctx.Err() == nil; remaining-- {
+		cmd := s.pendingSchedule.items[0].cmd
+		if change := cmd.ConfigChange; change.ChangeType == pb.StartReplica || change.ChangeType == pb.StartNonVotingReplica {
+			if _, stopped := stopping[change.Replica.ShardID]; stopped {
+				s.pendingSchedule.rotate()
+				continue
+			}
+		}
+		allowed := s.authorizeScheduledChange(ctx, cmd.ConfigChange, &validation)
+		if validation.failed {
+			s.pendingSchedule.rotate()
+			break
+		}
+		s.pendingSchedule.pop()
+		if !allowed {
+			continue
+		}
+		started := time.Now()
+		s.runtime.Logger().Info(fmt.Sprintf("%s applying cmd: %s", s.ID(), cmd.LogString()))
+		switch cmd.ConfigChange.ChangeType {
+		case pb.AddReplica:
+			s.handleAddReplica(cmd)
+		case pb.AddNonVotingReplica:
+			s.handleAddNonVotingReplica(cmd)
+		case pb.RemoveReplica, pb.RemoveNonVotingReplica:
+			s.handleRemoveReplica(cmd)
+		case pb.StartReplica:
+			s.handleStartReplica(cmd)
+		case pb.StartNonVotingReplica:
+			s.handleStartNonVotingReplica(cmd)
+		}
+		validation.charge(time.Since(started))
+	}
+}
+
+func isMembershipChange(change *pb.ConfigChange) bool {
+	switch change.ChangeType {
+	case pb.AddReplica, pb.AddNonVotingReplica, pb.RemoveReplica, pb.RemoveNonVotingReplica:
+		return true
+	default:
+		return false
+	}
+}
+
+type scheduleValidation struct {
+	remaining time.Duration
+	failed    bool
+}
+
+func (v *scheduleValidation) exhausted() bool              { return v.failed || v.remaining <= 0 }
+func (v *scheduleValidation) charge(elapsed time.Duration) { v.remaining -= elapsed }
+
+// Authorize against the latest HAKeeper observation immediately before each
+// operation. Ordered config changes still use the observed Raft index.
+func (s *Service) authorizeScheduledChange(ctx context.Context, change *pb.ConfigChange, validation *scheduleValidation) bool {
+	if s.haClient == nil {
+		validation.failed = true
+		return false
+	}
+	replica := change.Replica
+	started := time.Now()
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer func() {
+		cancel()
+		validation.charge(time.Since(started))
+	}()
+	state, err := s.haClient.GetLogScheduleState(ctx, replica.ShardID, replica.UUID, isMembershipChange(change))
+	if err != nil {
+		validation.failed = true
+		if !errors.Is(ctx.Err(), context.Canceled) {
+			s.runtime.Logger().Warn("cannot validate schedule command", zap.Error(err))
+		}
+		return false
+	}
+	if ctx.Err() != nil {
+		validation.failed = true
+		return false
+	}
+	shard, ok := state.LogState.Shards[replica.ShardID]
+	if change.ChangeType == pb.StartReplica || change.ChangeType == pb.StartNonVotingReplica {
+		if replica.UUID != s.ID() {
+			return false
+		}
+		if !ok {
+			return false
+		}
+		members := shard.Replicas
+		if change.ChangeType == pb.StartNonVotingReplica {
+			members = shard.NonVotingReplicas
+		}
+		return members[replica.ReplicaID] == s.ID()
+	}
+	if !ok {
+		return false
+	}
+	cfg := s.cfg.GetHAKeeperConfig()
+	cfg.Fill()
+	return slices.Contains(hakeeper.LogMembershipTargets(cfg, state.LogState, state.Tick, change.ChangeType, replica), s.ID())
 }
 
 func (s *Service) handleAddReplica(cmd pb.ScheduleCommand) {
@@ -103,7 +222,7 @@ func (s *Service) handleRemoveReplica(cmd pb.ScheduleCommand) {
 func (s *Service) handleStartReplica(cmd pb.ScheduleCommand) {
 	shardID := cmd.ConfigChange.Replica.ShardID
 	replicaID := cmd.ConfigChange.Replica.ReplicaID
-	join := len(cmd.ConfigChange.InitialMembers) == 0
+	join := len(cmd.ConfigChange.InitialMembers) == 0 && !s.store.nh.HasNodeInfo(shardID, replicaID)
 	if shardID == hakeeper.DefaultHAKeeperShardID {
 		if err := s.store.startHAKeeperReplica(replicaID,
 			cmd.ConfigChange.InitialMembers, join); err != nil {
@@ -120,7 +239,7 @@ func (s *Service) handleStartReplica(cmd pb.ScheduleCommand) {
 func (s *Service) handleStartNonVotingReplica(cmd pb.ScheduleCommand) {
 	shardID := cmd.ConfigChange.Replica.ShardID
 	replicaID := cmd.ConfigChange.Replica.ReplicaID
-	join := len(cmd.ConfigChange.InitialMembers) == 0
+	join := len(cmd.ConfigChange.InitialMembers) == 0 && !s.store.nh.HasNodeInfo(shardID, replicaID)
 	if shardID == hakeeper.DefaultHAKeeperShardID {
 		if err := s.store.startHAKeeperNonVotingReplica(replicaID,
 			cmd.ConfigChange.InitialMembers, join); err != nil {
@@ -155,14 +274,6 @@ func (s *Service) handleKillZombie(cmd pb.ScheduleCommand) {
 	replicaID := cmd.ConfigChange.Replica.ReplicaID
 	s.handleStopReplica(cmd)
 	s.store.removeMetadata(shardID, replicaID)
-}
-
-func (s *Service) handleShutdownStore(_ pb.ScheduleCommand) {
-	// notify main routine that have received shutdown cmd
-	select {
-	case s.shutdownC <- struct{}{}:
-	default:
-	}
 }
 
 func (s *Service) heartbeatWorker(ctx context.Context) {
@@ -262,5 +373,5 @@ func (s *Service) heartbeat(ctx context.Context) {
 
 	s.config.DecrCount()
 
-	s.handleCommands(cb.Commands)
+	s.handleCommands(ctx, cb.Commands)
 }

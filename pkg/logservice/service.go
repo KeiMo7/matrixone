@@ -35,6 +35,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/common/stopper"
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
+	"github.com/matrixorigin/matrixone/pkg/hakeeper"
 	"github.com/matrixorigin/matrixone/pkg/hakeeper/checkers/tnservice"
 	pb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
 	"github.com/matrixorigin/matrixone/pkg/taskservice"
@@ -74,7 +75,8 @@ type Service struct {
 	stopper     *stopper.Stopper
 	haClient    LogHAKeeperClient
 	fileService fileservice.FileService
-	shutdownC   chan struct{}
+	// Only the heartbeat worker accesses this queue.
+	pendingSchedule scheduleQueue
 
 	options struct {
 		// morpc client would filter remote backend via this
@@ -116,7 +118,6 @@ func NewService(
 		cfg:         cfg,
 		stopper:     stopper.NewStopper("log-service"),
 		fileService: fileService,
-		shutdownC:   shutdownC,
 	}
 	for _, opt := range opts {
 		opt(service)
@@ -415,7 +416,9 @@ func (s *Service) handleGetClusterDetails(ctx context.Context, req pb.Request) p
 
 func (s *Service) handleGetCheckerState(ctx context.Context, req pb.Request) pb.Response {
 	resp := getResponse(req)
-	if v, err := s.store.getCheckerState(); err != nil {
+	ctx, cancel := context.WithTimeout(ctx, hakeeperDefaultTimeout)
+	defer cancel()
+	if v, err := s.store.readCheckerState(ctx, &hakeeper.StateQuery{LogSchedule: req.LogScheduleQuery}); err != nil {
 		resp.ErrorCode, resp.ErrorMessage = toErrorCode(err)
 	} else {
 		resp.CheckerState = v

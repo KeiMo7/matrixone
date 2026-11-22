@@ -611,7 +611,7 @@ func TestFixExpiredStore(t *testing.T) {
 								NonVotingReplicas: map[uint64]string{4: "d", 5: "e"},
 								Epoch:             1,
 								LeaderID:          1},
-							ReplicaID: 2,
+							ReplicaID: 1,
 						}},
 					},
 					"b": {
@@ -687,6 +687,25 @@ func TestFixExpiredStore(t *testing.T) {
 
 	for i, c := range cases {
 		fmt.Printf("case %v: %s\n", i, c.desc)
+		// These legacy fixtures described running replicas by shard only.
+		// Supply their actual member identities and roles in the reports.
+		for uuid, store := range c.log.Stores {
+			for i := range store.Replicas {
+				r := &store.Replicas[i]
+				shard := c.log.Shards[r.ShardID]
+				for id, member := range shard.Replicas {
+					if member == uuid {
+						r.ReplicaID, r.IsNonVoting = id, false
+					}
+				}
+				for id, member := range shard.NonVotingReplicas {
+					if member == uuid {
+						r.ReplicaID, r.IsNonVoting = id, true
+					}
+				}
+			}
+			c.log.Stores[uuid] = store
+		}
 		coordinator := NewCoordinator("", hakeeper.Config{})
 		output := coordinator.Check(
 			c.idAlloc,
@@ -766,7 +785,7 @@ func TestFixZombie(t *testing.T) {
 								Replicas: map[uint64]string{1: "a", 2: "b", 4: "d"},
 								Epoch:    2,
 								LeaderID: 1},
-							ReplicaID: 3,
+							ReplicaID: 4,
 						}},
 					},
 				},
@@ -843,7 +862,7 @@ func TestFixZombie(t *testing.T) {
 								Replicas: map[uint64]string{1: "a", 2: "b", 4: "d"},
 								Epoch:    2,
 								LeaderID: 1},
-							ReplicaID: 3,
+							ReplicaID: 4,
 						}},
 					},
 				},

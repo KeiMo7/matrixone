@@ -60,7 +60,7 @@ const (
 )
 
 type IndexQuery struct{}
-type StateQuery struct{}
+type StateQuery struct{ LogSchedule *pb.LogScheduleQuery }
 type ScheduleCommandQuery struct{ UUID string }
 type ClusterDetailsQuery struct{ Cfg Config }
 
@@ -1034,6 +1034,50 @@ func (s *stateMachine) Update(e sm.Entry) (sm.Result, error) {
 	}
 }
 
+func (s *stateMachine) handleLogScheduleQuery(query *pb.LogScheduleQuery) *pb.CheckerState {
+	result := &pb.CheckerState{Tick: s.state.Tick, State: s.state.State}
+	shard, ok := s.state.LogState.Shards[query.ShardID]
+	if !ok {
+		return result
+	}
+	result.LogState.Shards = map[uint64]pb.LogShardInfo{
+		query.ShardID: *deepcopy.Copy(&shard).(*pb.LogShardInfo),
+	}
+	if !query.IncludeReports {
+		return result
+	}
+	result.LogState.Stores = make(map[string]pb.LogStoreInfo, len(shard.Replicas)+len(shard.NonVotingReplicas)+1)
+	addStore := func(uuid string) {
+		if uuid == "" {
+			return
+		}
+		if _, exists := result.LogState.Stores[uuid]; exists {
+			return
+		}
+		store, exists := s.state.LogState.Stores[uuid]
+		if !exists {
+			return
+		}
+		projected := pb.LogStoreInfo{Tick: store.Tick}
+		for _, r := range store.Replicas {
+			if r.ShardID == query.ShardID {
+				projected.Replicas = append(projected.Replicas, pb.LogReplicaInfo{
+					LogShardInfo: pb.LogShardInfo{ShardID: r.ShardID}, ReplicaID: r.ReplicaID, IsNonVoting: r.IsNonVoting,
+				})
+			}
+		}
+		result.LogState.Stores[uuid] = projected
+	}
+	for _, uuid := range shard.Replicas {
+		addStore(uuid)
+	}
+	for _, uuid := range shard.NonVotingReplicas {
+		addStore(uuid)
+	}
+	addStore(query.TargetStore)
+	return result
+}
+
 func (s *stateMachine) handleStateQuery() interface{} {
 	internal := &pb.CheckerState{
 		Tick:                         s.state.Tick,
@@ -1172,7 +1216,10 @@ func (s *stateMachine) handlePatchCNStore(cmd []byte) sm.Result {
 }
 
 func (s *stateMachine) Lookup(query interface{}) (interface{}, error) {
-	if _, ok := query.(*StateQuery); ok {
+	if q, ok := query.(*StateQuery); ok {
+		if q != nil && q.LogSchedule != nil {
+			return s.handleLogScheduleQuery(q.LogSchedule), nil
+		}
 		return s.handleStateQuery(), nil
 	} else if q, ok := query.(*ScheduleCommandQuery); ok {
 		return s.handleScheduleCommandQuery(q.UUID), nil

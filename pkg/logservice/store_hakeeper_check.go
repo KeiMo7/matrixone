@@ -484,7 +484,11 @@ func (l *store) getCheckerState() (*pb.CheckerState, error) {
 }
 
 func (l *store) getCheckerStateWithContext(ctx context.Context) (*pb.CheckerState, error) {
-	s, err := l.read(ctx, hakeeper.DefaultHAKeeperShardID, &hakeeper.StateQuery{})
+	return l.readCheckerState(ctx, &hakeeper.StateQuery{})
+}
+
+func (l *store) readCheckerState(ctx context.Context, query *hakeeper.StateQuery) (*pb.CheckerState, error) {
+	s, err := l.read(ctx, hakeeper.DefaultHAKeeperShardID, query)
 	if err != nil {
 		return &pb.CheckerState{}, moerr.AttachCause(ctx, err)
 	}

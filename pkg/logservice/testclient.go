@@ -78,7 +78,7 @@ func newTestService(genCfg func() Config) (*Service, ClientConfig, error) {
 			InitialMembers: map[uint64]string{1: service.ID()},
 		},
 	}
-	service.handleCommands([]pb.ScheduleCommand{cmd})
+	service.handleStartReplica(cmd)
 
 	ccfg := ClientConfig{
 		LogShardID:       1,
