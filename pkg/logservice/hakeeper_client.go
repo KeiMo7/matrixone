@@ -88,7 +88,7 @@ type TNHAKeeperClient interface {
 type LogHAKeeperClient interface {
 	basicHAKeeperClient
 	// GetLogScheduleState reads the bounded state needed to validate one command.
-	GetLogScheduleState(ctx context.Context, shardID uint64, targetStore string, includeReports bool) (pb.CheckerState, error)
+	GetLogScheduleState(ctx context.Context, shardID uint64, targetStore string) (pb.CheckerState, error)
 	// SendLogHeartbeat sends the specified heartbeat message to the HAKeeper. The
 	// returned CommandBatch contains Schedule Commands to be executed by the local
 	// Log store.
@@ -454,8 +454,8 @@ func (c *managedHAKeeperClient) GetClusterState(ctx context.Context) (pb.Checker
 	return c.getCheckerState(ctx, nil)
 }
 
-func (c *managedHAKeeperClient) GetLogScheduleState(ctx context.Context, shardID uint64, targetStore string, includeReports bool) (pb.CheckerState, error) {
-	return c.getCheckerState(ctx, &pb.LogScheduleQuery{ShardID: shardID, TargetStore: targetStore, IncludeReports: includeReports})
+func (c *managedHAKeeperClient) GetLogScheduleState(ctx context.Context, shardID uint64, targetStore string) (pb.CheckerState, error) {
+	return c.getCheckerState(ctx, &pb.LogScheduleQuery{ShardID: shardID, TargetStore: targetStore})
 }
 
 func (c *managedHAKeeperClient) getCheckerState(ctx context.Context, query *pb.LogScheduleQuery) (pb.CheckerState, error) {

@@ -350,7 +350,6 @@ message Request {
 message LogScheduleQuery {
   uint64 ShardID = 1;
   string TargetStore = 2;
-  bool IncludeReports = 3;
 }
 
 message LogResponse {

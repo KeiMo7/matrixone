@@ -15,11 +15,13 @@
 package logservice
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"reflect"
 	"slices"
+	"sort"
 	"time"
 
 	"go.uber.org/zap"
@@ -32,40 +34,46 @@ import (
 )
 
 func (s *Service) handleCommands(ctx context.Context, cmds []pb.ScheduleCommand) {
-	// StopReplica only initiates asynchronous Raft offload. Defer queued
-	// non-bootstrap starts for the same shard in this heartbeat batch.
-	stopping := make(map[uint64]struct{})
+	// Starts and cleanup must not wait behind a slow membership operation. The
+	// legacy scheduler owns retries; delivered commands are not retained here.
+	var membership []pb.ScheduleCommand
+	var stopping map[uint64]bool
 	for _, cmd := range cmds {
 		if change := cmd.GetConfigChange(); change != nil {
 			switch change.ChangeType {
 			case pb.StopReplica, pb.StopNonVotingReplica, pb.KillZombie:
-				stopping[change.Replica.ShardID] = struct{}{}
+				if stopping == nil {
+					stopping = make(map[uint64]bool)
+				}
+				stopping[change.Replica.ShardID] = true
 			}
 		}
 	}
-	// Bootstrap commands carry an initial membership and follow the existing
-	// bootstrap delivery protocol, including one-shot dynamic bootstrap.
-	validation := scheduleValidation{remaining: time.Second}
 	for _, cmd := range cmds {
+		if ctx.Err() != nil {
+			return
+		}
 		change := cmd.GetConfigChange()
 		if cmd.BootstrapShard != nil {
 			s.handleBootstrapShard(cmd)
 			continue
 		}
-		if cmd.Bootstrapping && change != nil && change.ChangeType == pb.StartReplica {
-			s.handleStartReplica(cmd)
+		if change != nil && isMembershipChange(change) {
+			membership = append(membership, cmd)
 			continue
 		}
-		if change != nil && (isMembershipChange(change) || change.ChangeType == pb.StartReplica || change.ChangeType == pb.StartNonVotingReplica) {
-			if !s.pendingSchedule.add(cmd) {
-				s.runtime.Logger().Warn("schedule command queue full; relying on HAKeeper retry", zap.String("command", cmd.LogString()))
-			}
+		if !cmd.Bootstrapping && change != nil && (change.ChangeType == pb.StartReplica || change.ChangeType == pb.StartNonVotingReplica) && stopping[change.Replica.ShardID] {
+			s.runtime.Logger().Warn("skipping replica start in the same batch as a stop", zap.String("command", cmd.LogString()))
 			continue
 		}
 		s.runtime.Logger().Info(fmt.Sprintf("%s applying cmd: %s", s.ID(), cmd.LogString()))
 		if change != nil {
 			s.runtime.Logger().Debug("applying schedule command:", zap.String("command", cmd.LogString()))
 			switch cmd.ConfigChange.ChangeType {
+			case pb.StartReplica:
+				s.handleStartReplica(cmd)
+			case pb.StartNonVotingReplica:
+				s.handleStartNonVotingReplica(cmd)
 			case pb.StopReplica:
 				s.handleStopReplica(cmd)
 			case pb.StopNonVotingReplica:
@@ -88,22 +96,29 @@ func (s *Service) handleCommands(ctx context.Context, cmds []pb.ScheduleCommand)
 		}
 	}
 
-	// Bound admission of work per heartbeat, while giving each read its own
-	// deadline. A failed read rotates to avoid starving unrelated shards.
-	for remaining := len(s.pendingSchedule.items); remaining > 0 && len(s.pendingSchedule.items) > 0 && !validation.exhausted() && ctx.Err() == nil; remaining-- {
-		cmd := s.pendingSchedule.items[0].cmd
-		if change := cmd.ConfigChange; change.ChangeType == pb.StartReplica || change.ChangeType == pb.StartNonVotingReplica {
-			if _, stopped := stopping[change.Replica.ShardID]; stopped {
-				s.pendingSchedule.rotate()
-				continue
-			}
-		}
+	if len(membership) == 0 {
+		return
+	}
+	// Bound admission, not an operation already in progress. Rotate by shard
+	// across batches so a repeatedly slow shard cannot always hide later ones.
+	slices.SortStableFunc(membership, func(a, b pb.ScheduleCommand) int {
+		return cmp.Compare(a.ConfigChange.Replica.ShardID, b.ConfigChange.Replica.ShardID)
+	})
+	start := 0
+	if s.hasMembershipCursor {
+		start = sort.Search(len(membership), func(i int) bool {
+			return membership[i].ConfigChange.Replica.ShardID > s.lastMembershipShard
+		}) % len(membership)
+	}
+	validation := scheduleValidation{remaining: time.Second}
+	for i := 0; i < len(membership) && !validation.exhausted() && ctx.Err() == nil; i++ {
+		cmd := membership[(start+i)%len(membership)]
+		s.lastMembershipShard = cmd.ConfigChange.Replica.ShardID
+		s.hasMembershipCursor = true
 		allowed := s.authorizeScheduledChange(ctx, cmd.ConfigChange, &validation)
 		if validation.failed {
-			s.pendingSchedule.rotate()
 			break
 		}
-		s.pendingSchedule.pop()
 		if !allowed {
 			continue
 		}
@@ -116,10 +131,6 @@ func (s *Service) handleCommands(ctx context.Context, cmds []pb.ScheduleCommand)
 			s.handleAddNonVotingReplica(cmd)
 		case pb.RemoveReplica, pb.RemoveNonVotingReplica:
 			s.handleRemoveReplica(cmd)
-		case pb.StartReplica:
-			s.handleStartReplica(cmd)
-		case pb.StartNonVotingReplica:
-			s.handleStartNonVotingReplica(cmd)
 		}
 		validation.charge(time.Since(started))
 	}
@@ -156,7 +167,7 @@ func (s *Service) authorizeScheduledChange(ctx context.Context, change *pb.Confi
 		cancel()
 		validation.charge(time.Since(started))
 	}()
-	state, err := s.haClient.GetLogScheduleState(ctx, replica.ShardID, replica.UUID, isMembershipChange(change))
+	state, err := s.haClient.GetLogScheduleState(ctx, replica.ShardID, replica.UUID)
 	if err != nil {
 		validation.failed = true
 		if !errors.Is(ctx.Err(), context.Canceled) {
@@ -166,23 +177,6 @@ func (s *Service) authorizeScheduledChange(ctx context.Context, change *pb.Confi
 	}
 	if ctx.Err() != nil {
 		validation.failed = true
-		return false
-	}
-	shard, ok := state.LogState.Shards[replica.ShardID]
-	if change.ChangeType == pb.StartReplica || change.ChangeType == pb.StartNonVotingReplica {
-		if replica.UUID != s.ID() {
-			return false
-		}
-		if !ok {
-			return false
-		}
-		members := shard.Replicas
-		if change.ChangeType == pb.StartNonVotingReplica {
-			members = shard.NonVotingReplicas
-		}
-		return members[replica.ReplicaID] == s.ID()
-	}
-	if !ok {
 		return false
 	}
 	cfg := s.cfg.GetHAKeeperConfig()

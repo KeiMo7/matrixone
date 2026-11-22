@@ -23,6 +23,7 @@ import (
 
 	"github.com/lni/dragonboat/v4"
 	"github.com/lni/vfs"
+	"github.com/matrixorigin/matrixone/pkg/hakeeper"
 	pb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
 	"github.com/stretchr/testify/require"
 )
@@ -66,9 +67,24 @@ func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 				require.NoError(t, services[i].Close())
 			}
 		})
-		require.NoError(t, services[i].store.startHAKeeperReplica(uint64(i+1), members, false))
+		if i < 2 {
+			initial := map[uint64]string{1: members[1], 2: members[2]}
+			require.NoError(t, services[i].store.startHAKeeperReplica(uint64(i+1), initial, false))
+		}
 		require.NoError(t, services[i].store.startReplica(1, uint64(i+1), members, false))
 	}
+	// C is a previously joined voter, so this also exercises the released
+	// branch's ordinary join=true restart path as a regression control.
+	var initial *dragonboat.Membership
+	require.Eventually(t, func() bool {
+		attempt, stop := context.WithTimeout(ctx, 300*time.Millisecond)
+		defer stop()
+		var err error
+		initial, err = services[0].store.nh.SyncGetShardMembership(attempt, 0)
+		return err == nil && len(initial.Nodes) == 2
+	}, 12*time.Second, 30*time.Millisecond)
+	require.NoError(t, services[0].store.nh.SyncRequestAddReplica(ctx, 0, 3, services[2].ID(), initial.ConfigChangeID))
+	require.NoError(t, services[2].store.startHAKeeperReplica(3, nil, true))
 	readMembership := func(s *Service, shard uint64) *dragonboat.Membership {
 		t.Helper()
 		var membership *dragonboat.Membership
@@ -104,11 +120,48 @@ func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 	require.Equal(t, members, state.LogState.Shards[1].Replicas)
 	old, err := a.store.nh.SyncPropose(ctx, a.store.nh.GetNoOPSession(1), getTestUserEntry())
 	require.NoError(t, err)
-	require.NoError(t, client.Close())
 
-	// Preserve C's Dragonboat files while modeling missing MO replica metadata.
+	// A Start delivered while HAKeeper has quorum must still be able to restore
+	// that quorum if a second voter goes away before command execution.
+	require.NoError(t, c.store.stopReplica(0, 3))
+	c.store.removeMetadata(0, 3)
+	require.NoError(t, c.Close())
+	services[2] = nil
+	open(2)
+	c = services[2]
+	require.True(t, c.store.nh.HasNodeInfo(0, 3))
+	c.store.addMetadata(0, 3, false)
+	c.haClient = client
+	controlStart := pb.ScheduleCommand{UUID: c.ID(), ServiceType: pb.LogService,
+		ConfigChange: &pb.ConfigChange{ChangeType: pb.StartReplica, Replica: pb.Replica{ShardID: 0, ReplicaID: 3, UUID: c.ID()}}}
+	var term uint64
+	require.Eventually(t, func() bool {
+		for _, s := range []*Service{a, b} {
+			leader, current, err := s.store.isLeaderHAKeeper()
+			if err == nil && leader {
+				term = current
+				return true
+			}
+		}
+		return false
+	}, 10*time.Second, 30*time.Millisecond)
+	_, err = a.store.nh.SyncPropose(ctx, a.store.nh.GetNoOPSession(0), hakeeper.GetUpdateCommandsCmd(term, []pb.ScheduleCommand{controlStart}))
+	require.NoError(t, err)
+	batch, err := client.SendLogHeartbeat(ctx, c.store.getHeartbeatMessage())
+	require.NoError(t, err)
+	require.Equal(t, []pb.ScheduleCommand{controlStart}, batch.Commands)
 	require.NoError(t, b.Close())
 	services[1] = nil
+	attempt, stop := context.WithTimeout(ctx, 500*time.Millisecond)
+	_, err = a.store.nh.SyncGetShardMembership(attempt, 0)
+	stop()
+	require.Error(t, err, "one control voter cannot authorize its own recovery")
+	c.handleCommands(ctx, batch.Commands)
+	readMembership(c, 0)
+	_, err = c.haClient.SendLogHeartbeat(ctx, c.store.getHeartbeatMessage())
+	require.NoError(t, err, "the restored control quorum must accept replicated writes")
+
+	// Preserve C's Dragonboat files while modeling missing MO replica metadata.
 	require.NoError(t, c.store.stopReplica(1, 3))
 	c.store.removeMetadata(1, 3)
 	require.NoError(t, c.Close())
@@ -118,7 +171,7 @@ func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 	require.True(t, c.store.nh.HasNodeInfo(1, 3))
 	_, _, _, err = c.store.nh.GetLeaderID(1)
 	require.ErrorIs(t, err, dragonboat.ErrShardNotFound)
-	attempt, stop := context.WithTimeout(ctx, 500*time.Millisecond)
+	attempt, stop = context.WithTimeout(ctx, 500*time.Millisecond)
 	_, err = a.store.nh.SyncPropose(attempt, a.store.nh.GetNoOPSession(1), getTestUserEntry())
 	stop()
 	require.Error(t, err, "one surviving data voter must not commit")
@@ -132,13 +185,8 @@ func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 	}, 10*time.Second, 50*time.Millisecond)
 	_, err = c.haClient.SendLogHeartbeat(ctx, c.store.getHeartbeatMessage())
 	require.NoError(t, err)
-	wrong := pb.ScheduleCommand{UUID: c.ID(), ServiceType: pb.LogService,
-		ConfigChange: &pb.ConfigChange{ChangeType: pb.StartReplica, Replica: pb.Replica{ShardID: 1, ReplicaID: 2, UUID: c.ID()}}}
-	c.handleCommands(context.Background(), []pb.ScheduleCommand{wrong})
-	_, _, _, err = c.store.nh.GetLeaderID(1)
-	require.ErrorIs(t, err, dragonboat.ErrShardNotFound, "another voter's ID must not be resurrected")
-	start := wrong
-	start.ConfigChange = &pb.ConfigChange{ChangeType: pb.StartReplica, Replica: pb.Replica{ShardID: 1, ReplicaID: 3, UUID: c.ID()}}
+	start := pb.ScheduleCommand{UUID: c.ID(), ServiceType: pb.LogService,
+		ConfigChange: &pb.ConfigChange{ChangeType: pb.StartReplica, Replica: pb.Replica{ShardID: 1, ReplicaID: 3, UUID: c.ID()}}}
 	shutdown := pb.ScheduleCommand{UUID: c.ID(), ServiceType: pb.LogService, ShutdownStore: &pb.ShutdownStore{StoreID: c.ID()}}
 	c.handleCommands(context.Background(), []pb.ScheduleCommand{shutdown, start})
 	readMembership(c, 1)
@@ -157,9 +205,7 @@ func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 		return err == nil && lsn >= next
 	}, 10*time.Second, 30*time.Millisecond)
 
-	// Once HAKeeper has observed the removal, an old command must not start
-	// the retired identity on a replacement disk. A later authorized identity
-	// can still join the same real Raft group.
+	// After removal, a replacement identity can join the same real Raft group.
 	open(1)
 	b = services[1]
 	readMembership(b, 1)
@@ -189,7 +235,7 @@ func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 					return false
 				}
 			}
-			state, err := c.haClient.GetLogScheduleState(attempt, 1, c.ID(), false)
+			state, err := c.haClient.GetLogScheduleState(attempt, 1, c.ID())
 			if err != nil {
 				return false
 			}
@@ -200,8 +246,6 @@ func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 		return observed
 	}
 	afterRemove := waitForReport(3, false)
-	c.handleCommands(ctx, []pb.ScheduleCommand{start})
-	require.False(t, c.store.nh.HasNodeInfo(1, 3), "an observed retired identity must not create Raft state")
 	require.NoError(t, a.store.nh.SyncRequestAddReplica(ctx, 1, 4, c.ID(), afterRemove.Epoch))
 	waitForReport(4, true)
 	replacement := pb.ScheduleCommand{UUID: c.ID(), ServiceType: pb.LogService,
@@ -232,7 +276,7 @@ func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 	require.NoError(t, err, "a one-shot dynamic bootstrap must form a writable three-node group")
 }
 
-func TestNonVotingStartChecksIdentityAndReopensDisk(t *testing.T) {
+func TestNonVotingStartReopensDisk(t *testing.T) {
 	cfg := getServiceTestConfig()
 	cfg.DataDir = t.TempDir()
 	cfg.SnapshotExportDir = filepath.Join(cfg.DataDir, "exported-snapshot")
@@ -251,24 +295,9 @@ func TestNonVotingStartChecksIdentityAndReopensDisk(t *testing.T) {
 		}
 	})
 	open()
-	state := func(voters, nonvoters map[uint64]string) pb.CheckerState {
-		return pb.CheckerState{LogState: pb.LogState{Shards: map[uint64]pb.LogShardInfo{
-			1: {ShardID: 1, Epoch: 3, Replicas: voters, NonVotingReplicas: nonvoters},
-		}}}
-	}
-	client := &scheduleStateClient{states: []pb.CheckerState{
-		state(map[uint64]string{2: service.ID()}, nil),
-		state(nil, map[uint64]string{2: "different-store"}),
-		state(nil, map[uint64]string{2: service.ID()}),
-	}}
-	service.haClient = client
 	start := pb.ScheduleCommand{UUID: service.ID(), ServiceType: pb.LogService,
 		ConfigChange: &pb.ConfigChange{ChangeType: pb.StartNonVotingReplica,
 			Replica: pb.Replica{UUID: service.ID(), ShardID: 1, ReplicaID: 2}}}
-	service.handleCommands(context.Background(), []pb.ScheduleCommand{start})
-	require.False(t, service.store.nh.HasNodeInfo(1, 2), "a voting identity must not authorize a non-voter")
-	service.handleCommands(context.Background(), []pb.ScheduleCommand{start})
-	require.False(t, service.store.nh.HasNodeInfo(1, 2), "another store's identity must not authorize this start")
 	service.handleCommands(context.Background(), []pb.ScheduleCommand{start})
 	require.True(t, service.store.nh.HasNodeInfo(1, 2))
 	require.NoError(t, service.store.stopReplica(1, 2))
@@ -278,13 +307,12 @@ func TestNonVotingStartChecksIdentityAndReopensDisk(t *testing.T) {
 
 	open()
 	require.True(t, service.store.nh.HasNodeInfo(1, 2), "the original Raft bootstrap must remain on disk")
-	service.haClient = &scheduleStateClient{states: []pb.CheckerState{state(nil, map[uint64]string{2: service.ID()})}}
 	service.handleCommands(context.Background(), []pb.ScheduleCommand{start})
 	var found bool
 	for _, local := range service.store.nh.GetNodeHostInfo(dragonboat.NodeHostInfoOption{SkipLogInfo: true}).ShardInfoList {
 		found = found || (local.ShardID == 1 && local.ReplicaID == 2)
 	}
-	require.True(t, found, "the authorized non-voter must reopen its original Raft state")
+	require.True(t, found, "the non-voter must reopen its original Raft state")
 	shards := service.store.getShards()
 	require.Len(t, shards, 1)
 	require.Equal(t, uint64(1), shards[0].ShardID)

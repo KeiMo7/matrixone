@@ -21,14 +21,20 @@ import (
 )
 
 // LogMembershipTargets returns reporting, retained voters that can submit the
-// change without knowingly losing the current or resulting voting majority.
-// Reports are observations, not a substitute for Raft's configuration index.
+// change with a reporting majority in both configurations. HAKeeper voting
+// changes also require a new majority to survive any old committing majority.
 func LogMembershipTargets(cfg Config, state pb.LogState, tick uint64, change pb.ConfigChangeType, replica pb.Replica) []string {
 	shard, ok := state.Shards[replica.ShardID]
-	if !ok || shard.Epoch != replica.Epoch || len(shard.Replicas) == 0 {
+	n := len(shard.Replicas)
+	if !ok || shard.Epoch != replica.Epoch || n == 0 {
 		return nil
 	}
 	voting := change == pb.AddReplica || change == pb.RemoveReplica
+	// With an odd number of voters, an old quorum can commit a direct change
+	// that leaves fewer than a quorum in the resulting HAKeeper configuration.
+	if voting && replica.ShardID == DefaultHAKeeperShardID && n%2 != 0 {
+		return nil
+	}
 	removing := change == pb.RemoveReplica || change == pb.RemoveNonVotingReplica
 	switch change {
 	case pb.RemoveReplica:
@@ -64,7 +70,6 @@ func LogMembershipTargets(cfg Config, state pb.LogState, tick uint64, change pb.
 		return nil
 	}
 
-	n := len(shard.Replicas)
 	resulting := n
 	if voting {
 		if removing {

@@ -1043,9 +1043,6 @@ func (s *stateMachine) handleLogScheduleQuery(query *pb.LogScheduleQuery) *pb.Ch
 	result.LogState.Shards = map[uint64]pb.LogShardInfo{
 		query.ShardID: *deepcopy.Copy(&shard).(*pb.LogShardInfo),
 	}
-	if !query.IncludeReports {
-		return result
-	}
 	result.LogState.Stores = make(map[string]pb.LogStoreInfo, len(shard.Replicas)+len(shard.NonVotingReplicas)+1)
 	addStore := func(uuid string) {
 		if uuid == "" {

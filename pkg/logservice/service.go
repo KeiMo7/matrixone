@@ -75,8 +75,9 @@ type Service struct {
 	stopper     *stopper.Stopper
 	haClient    LogHAKeeperClient
 	fileService fileservice.FileService
-	// Only the heartbeat worker accesses this queue.
-	pendingSchedule scheduleQueue
+	// Only the heartbeat worker advances the membership admission cursor.
+	lastMembershipShard uint64
+	hasMembershipCursor bool
 
 	options struct {
 		// morpc client would filter remote backend via this

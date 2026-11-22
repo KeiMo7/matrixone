@@ -17,7 +17,6 @@ package logservice
 import (
 	"context"
 	"fmt"
-	"strings"
 	"testing"
 	"time"
 
@@ -507,7 +506,7 @@ type scheduleStateClient struct {
 }
 
 func (c *scheduleStateClient) Close() error { return nil }
-func (c *scheduleStateClient) GetLogScheduleState(ctx context.Context, _ uint64, _ string, _ bool) (pb.CheckerState, error) {
+func (c *scheduleStateClient) GetLogScheduleState(ctx context.Context, _ uint64, _ string) (pb.CheckerState, error) {
 	c.calls++
 	if c.waitForDeadline {
 		<-ctx.Done()
@@ -517,49 +516,67 @@ func (c *scheduleStateClient) GetLogScheduleState(ctx context.Context, _ uint64,
 	return c.states[index], nil
 }
 
-func TestScheduleStartsRevalidateEachCommand(t *testing.T) {
-	runServiceTest(t, false, true, func(t *testing.T, s *Service) {
-		first := pb.CheckerState{State: pb.HAKeeperRunning, LogState: pb.LogState{Shards: map[uint64]pb.LogShardInfo{
-			1: {ShardID: 1, Replicas: map[uint64]string{1: s.ID()}},
-			2: {ShardID: 2, Replicas: map[uint64]string{2: s.ID()}},
-		}}}
-		second := pb.CheckerState{State: pb.HAKeeperRunning, LogState: pb.LogState{Shards: map[uint64]pb.LogShardInfo{
-			2: {ShardID: 2, Epoch: 2, Replicas: map[uint64]string{2: "different-store"}},
-		}}}
-		client := &scheduleStateClient{states: []pb.CheckerState{first, second}}
+func TestDeliveredStartRunsBeforeMembershipValidation(t *testing.T) {
+	runServiceTest(t, false, false, func(t *testing.T, s *Service) {
+		client := &startBeforeReadClient{store: s.store}
 		s.haClient = client
-		start := func(shard, replica uint64) pb.ScheduleCommand {
-			return pb.ScheduleCommand{UUID: s.ID(), ServiceType: pb.LogService,
-				ConfigChange: &pb.ConfigChange{ChangeType: pb.StartReplica, Replica: pb.Replica{UUID: s.ID(), ShardID: shard, ReplicaID: replica}}}
-		}
-		s.handleCommands(context.Background(), []pb.ScheduleCommand{start(1, 1), start(2, 2)})
-		require.Equal(t, 2, client.calls, "each side effect requires a fresh HAKeeper observation")
-		require.False(t, hasReplica(s.store, 2, 2), "a newly observed removal must block the old start")
+		change := pb.ScheduleCommand{UUID: s.ID(), ServiceType: pb.LogService,
+			ConfigChange: &pb.ConfigChange{ChangeType: pb.AddNonVotingReplica,
+				Replica: pb.Replica{UUID: "other", ShardID: 1, ReplicaID: 2}}}
+		start := pb.ScheduleCommand{UUID: s.ID(), ServiceType: pb.LogService,
+			ConfigChange: &pb.ConfigChange{ChangeType: pb.StartReplica,
+				Replica: pb.Replica{UUID: s.ID(), ShardID: 2, ReplicaID: 2}}}
+		s.handleCommands(context.Background(), []pb.ScheduleCommand{change, start})
+		require.True(t, client.sawStart, "the independent Start must precede the membership read")
+		require.Equal(t, 1, client.calls)
+		s.handleCommands(context.Background(), nil)
+		require.Equal(t, 1, client.calls, "an unsuccessful read must not retain the command")
 	})
 }
 
-func TestScheduleDefersStartAfterStoppingSameShard(t *testing.T) {
+func TestStartConflictingWithBatchStopNeedsRedelivery(t *testing.T) {
 	runServiceTest(t, false, false, func(t *testing.T, s *Service) {
 		require.NoError(t, s.store.startReplica(1, 1, map[uint64]dragonboat.Target{1: s.ID()}, false))
-		client := &scheduleStateClient{states: []pb.CheckerState{{State: pb.HAKeeperRunning, LogState: pb.LogState{
-			Shards: map[uint64]pb.LogShardInfo{
-				1: {ShardID: 1, Epoch: 2, Replicas: map[uint64]string{2: s.ID()}},
-				2: {ShardID: 2, Epoch: 2, Replicas: map[uint64]string{5: s.ID()}},
-			},
-		}}}}
-		s.haClient = client
 		start := func(shard, replica uint64) pb.ScheduleCommand {
 			return pb.ScheduleCommand{UUID: s.ID(), ServiceType: pb.LogService,
 				ConfigChange: &pb.ConfigChange{ChangeType: pb.StartReplica, Replica: pb.Replica{UUID: s.ID(), ShardID: shard, ReplicaID: replica}}}
 		}
 		kill := pb.ScheduleCommand{UUID: s.ID(), ServiceType: pb.LogService,
 			ConfigChange: &pb.ConfigChange{ChangeType: pb.KillZombie, Replica: pb.Replica{UUID: s.ID(), ShardID: 1, ReplicaID: 1}}}
-		s.handleCommands(context.Background(), []pb.ScheduleCommand{start(1, 2), kill, start(2, 5)})
-		require.False(t, s.store.nh.HasNodeInfo(1, 2), "same-batch stop must not be followed by a new local instance")
-		require.True(t, s.store.nh.HasNodeInfo(2, 5), "unrelated shards must continue")
-		require.Len(t, s.pendingSchedule.items, 1)
-		require.Equal(t, uint64(1), s.pendingSchedule.items[0].cmd.ConfigChange.Replica.ShardID)
+		s.handleCommands(context.Background(), []pb.ScheduleCommand{kill, start(1, 2), start(2, 5)})
+		require.False(t, s.store.nh.HasNodeInfo(1, 2), "the stopped shard must not start a new instance in the same batch")
+		require.True(t, s.store.nh.HasNodeInfo(2, 5), "an independent start must still run")
+		s.handleCommands(context.Background(), nil)
+		require.False(t, s.store.nh.HasNodeInfo(1, 2), "a later empty heartbeat must not replay the skipped start")
 	})
+}
+
+func TestCanceledServiceDoesNotStartDeliveredReplicas(t *testing.T) {
+	runServiceTest(t, false, false, func(t *testing.T, s *Service) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		start := pb.ScheduleCommand{UUID: s.ID(), ServiceType: pb.LogService,
+			ConfigChange: &pb.ConfigChange{ChangeType: pb.StartReplica, Replica: pb.Replica{UUID: s.ID(), ShardID: 1, ReplicaID: 1}}}
+		bootstrap := pb.ScheduleCommand{UUID: s.ID(), ServiceType: pb.LogService,
+			BootstrapShard: &pb.BootstrapShard{ShardID: 2, ReplicaID: 2, InitialMembers: map[uint64]string{2: s.ID()}}}
+		s.handleCommands(ctx, []pb.ScheduleCommand{start, bootstrap})
+		require.False(t, s.store.nh.HasNodeInfo(1, 1))
+		require.False(t, s.store.nh.HasNodeInfo(2, 2))
+	})
+}
+
+type startBeforeReadClient struct {
+	LogHAKeeperClient
+	store    *store
+	sawStart bool
+	calls    int
+}
+
+func (c *startBeforeReadClient) Close() error { return nil }
+func (c *startBeforeReadClient) GetLogScheduleState(context.Context, uint64, string) (pb.CheckerState, error) {
+	c.calls++
+	c.sawStart = c.store.nh.HasNodeInfo(2, 2)
+	return pb.CheckerState{}, context.DeadlineExceeded
 }
 
 func TestBootstrapCommandsDoNotDependOnScheduleValidation(t *testing.T) {
@@ -570,9 +587,12 @@ func TestBootstrapCommandsDoNotDependOnScheduleValidation(t *testing.T) {
 			ConfigChange: &pb.ConfigChange{ChangeType: pb.StartReplica,
 				Replica:        pb.Replica{UUID: s.ID(), ShardID: 1, ReplicaID: 1},
 				InitialMembers: map[uint64]string{1: s.ID()}}}
+		stop := pb.ScheduleCommand{UUID: s.ID(), ServiceType: pb.LogService,
+			ConfigChange: &pb.ConfigChange{ChangeType: pb.StopReplica,
+				Replica: pb.Replica{UUID: s.ID(), ShardID: 1, ReplicaID: 99}}}
 		dynamic := pb.ScheduleCommand{UUID: s.ID(), ServiceType: pb.LogService,
 			BootstrapShard: &pb.BootstrapShard{ShardID: 2, ReplicaID: 2, InitialMembers: map[uint64]string{2: s.ID()}}}
-		s.handleCommands(context.Background(), []pb.ScheduleCommand{initial, dynamic})
+		s.handleCommands(context.Background(), []pb.ScheduleCommand{stop, initial, dynamic})
 		require.Zero(t, client.calls, "bootstrap must not be lost to a validation read")
 		require.True(t, s.store.nh.HasNodeInfo(1, 1))
 		require.True(t, s.store.nh.HasNodeInfo(2, 2))
@@ -581,73 +601,64 @@ func TestBootstrapCommandsDoNotDependOnScheduleValidation(t *testing.T) {
 
 type slowScheduleStateClient struct {
 	LogHAKeeperClient
-	storeID string
+	calls   []uint64
+	healthy pb.CheckerState
 }
 
 func (c *slowScheduleStateClient) Close() error { return nil }
-func (c *slowScheduleStateClient) GetLogScheduleState(ctx context.Context, shard uint64, _ string, _ bool) (pb.CheckerState, error) {
-	timer := time.NewTimer(1100 * time.Millisecond)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return pb.CheckerState{}, ctx.Err()
-	case <-timer.C:
-	}
+func (c *slowScheduleStateClient) GetLogScheduleState(ctx context.Context, shard uint64, _ string) (pb.CheckerState, error) {
+	c.calls = append(c.calls, shard)
 	if shard == 1 {
-		return pb.CheckerState{State: pb.HAKeeperRunning, LogState: pb.LogState{Shards: map[uint64]pb.LogShardInfo{
-			1: {ShardID: 1, Replicas: map[uint64]string{99: c.storeID}},
-		}}}, nil
+		timer := time.NewTimer(1100 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return pb.CheckerState{}, ctx.Err()
+		case <-timer.C:
+		}
 	}
-	return pb.CheckerState{State: pb.HAKeeperRunning, LogState: pb.LogState{Shards: map[uint64]pb.LogShardInfo{
-		2: {ShardID: 2, Replicas: map[uint64]string{2: c.storeID}},
-	}}}, nil
+	return c.healthy, nil
 }
 
-func TestScheduleValidationBudgetRotatesPendingStarts(t *testing.T) {
-	runServiceTest(t, false, true, func(t *testing.T, s *Service) {
-		s.haClient = &slowScheduleStateClient{storeID: s.ID()}
-		// This start remains unsuccessful: the local shard already runs with
-		// another ID. The next start needs a complete read of its own.
-		first := pb.ScheduleCommand{UUID: s.ID(), ServiceType: pb.LogService,
-			ConfigChange: &pb.ConfigChange{ChangeType: pb.StartReplica, Replica: pb.Replica{UUID: s.ID(), ShardID: 1, ReplicaID: 99}}}
-		second := pb.ScheduleCommand{UUID: s.ID(), ServiceType: pb.LogService,
-			ConfigChange: &pb.ConfigChange{ChangeType: pb.StartReplica, Replica: pb.Replica{UUID: s.ID(), ShardID: 2, ReplicaID: 2},
-				InitialMembers: map[uint64]string{2: s.ID()}}}
-		s.handleCommands(context.Background(), []pb.ScheduleCommand{first, second})
-		require.False(t, hasReplica(s.store, 2, 2), "the second read exceeds the first batch's remaining budget")
-		s.handleCommands(context.Background(), []pb.ScheduleCommand{first, second})
-		mustHaveReplica(t, s.store, 2, 2)
+func TestMembershipAdmissionRotatesWithoutRetainingCommands(t *testing.T) {
+	runServiceTest(t, false, false, func(t *testing.T, s *Service) {
+		require.NoError(t, s.store.startReplica(2, 1, map[uint64]dragonboat.Target{1: s.ID()}, false))
+		target := uuid.NewString()
+		var current *dragonboat.Membership
+		require.Eventually(t, func() bool {
+			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+			defer cancel()
+			var err error
+			current, err = s.store.nh.SyncGetShardMembership(ctx, 2)
+			return err == nil && len(current.Nodes) == 1
+		}, 10*time.Second, 30*time.Millisecond)
+		shard := pb.LogShardInfo{ShardID: 2, Epoch: current.ConfigChangeID, Replicas: map[uint64]string{1: s.ID()}}
+		client := &slowScheduleStateClient{healthy: pb.CheckerState{Tick: 1, LogState: pb.LogState{
+			Shards: map[uint64]pb.LogShardInfo{2: shard},
+			Stores: map[string]pb.LogStoreInfo{
+				s.ID(): {Tick: 1, Replicas: []pb.LogReplicaInfo{{LogShardInfo: shard, ReplicaID: 1}}},
+				target: {Tick: 1},
+			},
+		}}}
+		s.haClient = client
+		change := func(shard uint64) pb.ScheduleCommand {
+			return pb.ScheduleCommand{UUID: s.ID(), ServiceType: pb.LogService,
+				ConfigChange: &pb.ConfigChange{ChangeType: pb.AddNonVotingReplica,
+					Replica: pb.Replica{UUID: target, ShardID: shard, ReplicaID: 9, Epoch: current.ConfigChangeID}}}
+		}
+		s.handleCommands(context.Background(), []pb.ScheduleCommand{change(1), change(2)})
+		require.Equal(t, []uint64{1}, client.calls, "one slow read exhausts this batch's admission budget")
+		s.handleCommands(context.Background(), nil)
+		require.Equal(t, []uint64{1}, client.calls, "a later empty heartbeat must not replay commands")
+		s.handleCommands(context.Background(), []pb.ScheduleCommand{change(2), change(1)})
+		require.GreaterOrEqual(t, len(client.calls), 2)
+		require.Equal(t, uint64(2), client.calls[1], "a redelivered healthy shard must not be starved by batch order")
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		actual, err := s.store.nh.SyncGetShardMembership(ctx, 2)
+		require.NoError(t, err)
+		require.Equal(t, target, actual.NonVotings[9], "the healthy shard must actually commit the membership change")
 	})
-}
-
-func TestScheduleQueueDeduplicatesFullCommandAndBoundsRetention(t *testing.T) {
-	var queue scheduleQueue
-	start := func(shard uint64, members map[uint64]string) pb.ScheduleCommand {
-		return pb.ScheduleCommand{UUID: "store", ServiceType: pb.LogService, Bootstrapping: true,
-			ConfigChange: &pb.ConfigChange{ChangeType: pb.StartReplica,
-				Replica: pb.Replica{UUID: "store", ShardID: shard, ReplicaID: 1}, InitialMembers: members}}
-	}
-	first := start(1, map[uint64]string{1: "store", 2: "other"})
-	same := start(1, map[uint64]string{2: "other", 1: "store"})
-	different := start(1, map[uint64]string{1: "store", 2: "changed"})
-	require.True(t, queue.add(first))
-	require.True(t, queue.add(same))
-	require.Len(t, queue.items, 1, "map iteration order must not create duplicates")
-	require.True(t, queue.add(different))
-	require.Len(t, queue.items, 2, "different initial membership must not be merged")
-	for len(queue.items) < maxPendingScheduleCommands {
-		require.True(t, queue.add(start(uint64(len(queue.items)+1), nil)))
-	}
-	require.False(t, queue.add(start(5000, nil)))
-	queue.pop()
-	require.True(t, queue.add(start(5000, nil)), "draining makes room for retried work")
-	for len(queue.items) != 0 {
-		queue.pop()
-	}
-	require.Zero(t, queue.bytes)
-	require.Empty(t, queue.byKey)
-	oversized := start(1, map[uint64]string{1: strings.Repeat("x", maxPendingScheduleBytes)})
-	require.False(t, queue.add(oversized))
 }
 
 type blockingScheduleStateClient struct {
@@ -656,7 +667,7 @@ type blockingScheduleStateClient struct {
 }
 
 func (c *blockingScheduleStateClient) Close() error { return nil }
-func (c *blockingScheduleStateClient) GetLogScheduleState(ctx context.Context, _ uint64, _ string, _ bool) (pb.CheckerState, error) {
+func (c *blockingScheduleStateClient) GetLogScheduleState(ctx context.Context, _ uint64, _ string) (pb.CheckerState, error) {
 	close(c.started)
 	<-ctx.Done()
 	return pb.CheckerState{}, ctx.Err()
@@ -672,7 +683,7 @@ func TestScheduleValidationStopsOnServiceCancellation(t *testing.T) {
 		go func() {
 			defer close(done)
 			s.handleCommands(ctx, []pb.ScheduleCommand{{UUID: s.ID(), ServiceType: pb.LogService,
-				ConfigChange: &pb.ConfigChange{ChangeType: pb.StartReplica, Replica: pb.Replica{UUID: s.ID(), ShardID: 1, ReplicaID: 1}}}})
+				ConfigChange: &pb.ConfigChange{ChangeType: pb.AddReplica, Replica: pb.Replica{UUID: s.ID(), ShardID: 1, ReplicaID: 1}}}})
 		}()
 		select {
 		case <-client.started:

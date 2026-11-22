@@ -382,7 +382,7 @@ func TestCoordinatorRepairsAfterMissingReplicaReport(t *testing.T) {
 	}
 	cmds := recoveryCommands()
 	require.True(t, hasChange(cmds, pb.StartReplica, 1, "log-c"), "start the missing configured replica")
-	require.True(t, hasChange(cmds, pb.RemoveReplica, 0, "log-b"), "repair a shard with enough voter reports")
+	require.False(t, hasChange(cmds, pb.RemoveReplica, 0, "log-b"), "do not risk the HAKeeper commit quorum")
 	require.False(t, hasChange(cmds, pb.RemoveReplica, 1, "log-b"))
 	report := state.LogState.Stores["log-c"]
 	report.Replicas = append(report.Replicas, pb.LogReplicaInfo{LogShardInfo: data, ReplicaID: 3, IsNonVoting: true})
@@ -673,5 +673,51 @@ func TestCoordinatorGatesMembershipWithoutVoterMajority(t *testing.T) {
 				t.Fatalf("membership change without voting majority: %+v", command)
 			}
 		}
+	}
+}
+
+func TestCoordinatorReplansUnconsumedMembershipAfterExpiry(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		recovered bool
+	}{{"still required", false}, {"target recovered", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, state, alloc := tnStartScenario(t)
+			state.Tick = 10000
+			state.TNState = pb.TNState{}
+			state.ClusterInfo = pb.ClusterInfo{LogShards: []metadata.LogShardRecord{{ShardID: 1, NumberOfReplicas: 3}}}
+			shard := pb.LogShardInfo{ShardID: 1, Epoch: 7, LeaderID: 1, Replicas: map[uint64]string{1: "a", 2: "b", 3: "c"}}
+			state.LogState = pb.LogState{Shards: map[uint64]pb.LogShardInfo{1: shard}, Stores: map[string]pb.LogStoreInfo{
+				"a": {Tick: state.Tick, Replicas: []pb.LogReplicaInfo{{LogShardInfo: shard, ReplicaID: 1}}},
+				"b": {Tick: 0, Replicas: []pb.LogReplicaInfo{{LogShardInfo: shard, ReplicaID: 2}}},
+				"c": {Tick: state.Tick, Replicas: []pb.LogReplicaInfo{{LogShardInfo: shard, ReplicaID: 3}}},
+			}}
+			hasRemoval := func(cmds []pb.ScheduleCommand) bool {
+				for _, cmd := range cmds {
+					if cmd.ConfigChange != nil && cmd.ConfigChange.ChangeType == pb.RemoveReplica && cmd.ConfigChange.Replica.ReplicaID == 2 {
+						return true
+					}
+				}
+				return false
+			}
+			require.True(t, hasRemoval(c.Check(alloc, state, false)))
+			var removal *operator.Operator
+			for _, op := range c.OperatorController.GetOperators(1) {
+				for _, step := range op.OpSteps() {
+					if r, ok := step.(operator.RemoveLogService); ok && r.ReplicaID == 2 {
+						removal = op
+					}
+				}
+			}
+			require.NotNil(t, removal)
+			require.False(t, hasRemoval(c.Check(alloc, state, false)), "a still-owned operator is not repeatedly delivered")
+			if tc.recovered {
+				store := state.LogState.Stores["b"]
+				store.Tick = state.Tick
+				state.LogState.Stores["b"] = store
+			}
+			removal.SetStatus(operator.EXPIRED)
+			require.Equal(t, !tc.recovered, hasRemoval(c.Check(alloc, state, false)), "retry must follow the current desired state")
+		})
 	}
 }

@@ -257,9 +257,9 @@ type localScheduleStateClient struct {
 
 func (c *localScheduleStateClient) Close() error { return nil }
 
-func (c *localScheduleStateClient) GetLogScheduleState(ctx context.Context, shard uint64, target string, reports bool) (pb.CheckerState, error) {
+func (c *localScheduleStateClient) GetLogScheduleState(ctx context.Context, shard uint64, target string) (pb.CheckerState, error) {
 	state, err := c.store.readCheckerState(ctx, &hakeeper.StateQuery{LogSchedule: &pb.LogScheduleQuery{
-		ShardID: shard, TargetStore: target, IncludeReports: reports,
+		ShardID: shard, TargetStore: target,
 	}})
 	return *state, err
 }
@@ -534,6 +534,49 @@ func TestHAKeeperCanBootstrapAndRepairShards(t *testing.T) {
 		_, err = services[0].store.addTNStoreHeartbeat(ctx, tnMsg2)
 		require.NoError(t, err)
 
+		before, err := leaderStore.nh.SyncGetShardMembership(ctx, hakeeper.DefaultHAKeeperShardID)
+		require.NoError(t, err)
+		require.Equal(t, services[0].ID(), before.Nodes[1])
+
+		// Even a previously queued add must not reconfigure an odd-sized
+		// HAKeeper, including when all three voters are reporting.
+		sendHeartbeat(services[:3])
+		_, err = leaderStore.addLogStoreHeartbeat(ctx, services[3].store.getHeartbeatMessage())
+		require.NoError(t, err)
+		state, err = leaderStore.getCheckerState()
+		require.NoError(t, err)
+		require.Equal(t, before.ConfigChangeID, state.LogState.Shards[hakeeper.DefaultHAKeeperShardID].Epoch)
+		cfg := services[1].cfg.GetHAKeeperConfig()
+		cfg.Fill()
+		spare, ok := state.LogState.Stores[services[3].ID()]
+		require.True(t, ok)
+		require.False(t, cfg.LogStoreExpired(spare.Tick, state.Tick))
+		for id, uuid := range before.Nodes {
+			voter, ok := state.LogState.Stores[uuid]
+			require.True(t, ok)
+			require.False(t, cfg.LogStoreExpired(voter.Tick, state.Tick))
+			reports := voter.Replicas
+			require.Condition(t, func() bool {
+				for _, report := range reports {
+					if report.ShardID == hakeeper.DefaultHAKeeperShardID && report.ReplicaID == id && !report.IsNonVoting {
+						return true
+					}
+				}
+				return false
+			}, "voter %s/%d has not reported its current role", uuid, id)
+		}
+		executor := services[1]
+		executor.handleCommands(ctx, []pb.ScheduleCommand{{
+			UUID: executor.ID(), ServiceType: pb.LogService,
+			ConfigChange: &pb.ConfigChange{ChangeType: pb.AddReplica, Replica: pb.Replica{
+				ShardID: hakeeper.DefaultHAKeeperShardID, ReplicaID: 1000, UUID: services[3].ID(), Epoch: before.ConfigChangeID,
+			}},
+		}})
+		control, err := leaderStore.nh.SyncGetShardMembership(ctx, hakeeper.DefaultHAKeeperShardID)
+		require.NoError(t, err)
+		require.Equal(t, before.ConfigChangeID, control.ConfigChangeID)
+		require.Equal(t, before.Nodes, control.Nodes)
+
 		// stop store 1
 		require.NoError(t, services[0].Close())
 		// no service.Close can be repeatedly called
@@ -545,7 +588,7 @@ func TestHAKeeperCanBootstrapAndRepairShards(t *testing.T) {
 			service.haClient = &localScheduleStateClient{store: services[0].store}
 		}
 
-		// wait for HAKeeper to repair the Log & HAKeeper shards
+		// Repair the data and TN shards with the surviving control majority.
 		tnRepaired := false
 		for i := 0; i < 5000; i++ {
 			testLogger.Debug(fmt.Sprintf("iteration %d", i))
@@ -597,7 +640,7 @@ func TestHAKeeperCanBootstrapAndRepairShards(t *testing.T) {
 
 				logRepaired := true
 				for _, s := range services {
-					if !hasShard(s.store, 0) || !hasShard(s.store, 1) {
+					if !hasShard(s.store, 1) {
 						logRepaired = false
 						break
 					}
@@ -616,6 +659,20 @@ func TestHAKeeperCanBootstrapAndRepairShards(t *testing.T) {
 				t.Fatalf("unexpected error %v", err)
 			}
 			if completed {
+				// Delivery of an old remove with the still-current CCI must be
+				// checked again, rather than submitted to Raft.
+				executor := services[0]
+				executor.handleCommands(ctx, []pb.ScheduleCommand{{
+					UUID: executor.ID(), ServiceType: pb.LogService,
+					ConfigChange: &pb.ConfigChange{ChangeType: pb.RemoveReplica, Replica: pb.Replica{
+						ShardID: hakeeper.DefaultHAKeeperShardID, ReplicaID: 1, UUID: before.Nodes[1], Epoch: before.ConfigChangeID,
+					}},
+				}})
+				control, err := executor.store.nh.SyncGetShardMembership(ctx, hakeeper.DefaultHAKeeperShardID)
+				require.NoError(t, err)
+				require.Equal(t, before.ConfigChangeID, control.ConfigChangeID)
+				require.Equal(t, before.Nodes, control.Nodes)
+				require.False(t, hasShard(services[2].store, hakeeper.DefaultHAKeeperShardID))
 				for _, s := range services[:3] {
 					_ = s.task.holder.Close()
 				}
