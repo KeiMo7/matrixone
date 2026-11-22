@@ -103,6 +103,11 @@ func (c checker) membershipChangeInFlight(shardID uint64) bool {
 		len(c.lc.executingNonVoting.Removing[shardID]) > 0
 }
 
+func replicaIsStarting(voting, nonVoting operator.ExecutingReplicas, shardID, replicaID uint64) bool {
+	return slices.Contains(voting.Starting[shardID], replicaID) ||
+		slices.Contains(nonVoting.Starting[shardID], replicaID)
+}
+
 // checkToBootstrap is different with checkToAdd. checkToBootstrap checks
 // if there are some start replicas with initial members, in which case,
 // there are no the original replicas.
@@ -322,7 +327,8 @@ func (cr *checkToRemove) check() []*operator.Operator {
 				})
 			}
 			for _, toRemoveReplica := range replicasToRemove {
-				if contains(removing[shardID], toRemoveReplica.replicaID) {
+				if contains(removing[shardID], toRemoveReplica.replicaID) ||
+					replicaIsStarting(cr.lc.executing, cr.lc.executingNonVoting, shardID, toRemoveReplica.replicaID) {
 					continue
 				}
 				executorCandidates := hakeeper.LogMembershipTargets(cr.lc.Cfg, cr.lc.logState, cr.lc.CurrentTick, changeType,

@@ -285,6 +285,12 @@ func TestTNRetryPreservesPendingLogStart(t *testing.T) {
 				require.NoError(t, err)
 				return r
 			}
+			// The delivery RSM must observe the same membership as the checker.
+			for _, id := range []string{"a", "b"} {
+				report, err := (&pb.LogStoreHeartbeat{UUID: id, Replicas: state.LogState.Stores[id].Replicas}).Marshal()
+				require.NoError(t, err)
+				apply(hakeeper.GetLogStoreHeartbeatCmd(report))
+			}
 			first := coordinator.Check(alloc, state, false)
 			var logStart *pb.ScheduleCommand
 			for i := range first {
@@ -568,6 +574,116 @@ func TestCoordinatorPreservesVotingQuorumAfterRemoval(t *testing.T) {
 			require.Equal(t, pb.RemoveReplica, membership[0].ConfigChange.ChangeType)
 			require.Equal(t, tc.wantRemove, membership[0].ConfigChange.Replica.UUID)
 			require.Contains(t, []string{"log-a", "log-b", "log-c"}, membership[0].UUID)
+		})
+	}
+}
+
+func TestCoordinatorWaitsForInFlightStartBeforeRemovingReplica(t *testing.T) {
+	for _, finish := range []string{"reported", "expired"} {
+		t.Run(finish, func(t *testing.T) {
+			c := NewCoordinator("", hakeeper.Config{})
+			alloc := util.NewTestIDAllocator(100)
+			shard := pb.LogShardInfo{ShardID: 1, Epoch: 7,
+				Replicas: map[uint64]string{1: "a", 2: "b", 3: "c", 4: "d", 5: "e"}}
+			state := pb.CheckerState{Tick: 1,
+				ClusterInfo: pb.ClusterInfo{LogShards: []metadata.LogShardRecord{{ShardID: 1, NumberOfReplicas: 3}}},
+				LogState:    pb.LogState{Shards: map[uint64]pb.LogShardInfo{1: shard}, Stores: map[string]pb.LogStoreInfo{}},
+			}
+			observe := func(reportE bool) {
+				state.LogState.Shards[1] = shard
+				for id, uuid := range shard.Replicas {
+					store := pb.LogStoreInfo{Tick: 1, TaskServiceCreated: true}
+					if id <= 3 || (id == 5 && reportE) {
+						store.Replicas = []pb.LogReplicaInfo{{LogShardInfo: shard, ReplicaID: id}}
+					}
+					state.LogState.Stores[uuid] = store
+				}
+			}
+			commandsOf := func(commands []pb.ScheduleCommand, kind pb.ConfigChangeType) []uint64 {
+				var ids []uint64
+				for _, command := range commands {
+					if command.ConfigChange != nil && command.ConfigChange.ChangeType == kind {
+						ids = append(ids, command.ConfigChange.Replica.ReplicaID)
+					}
+				}
+				return ids
+			}
+			observe(false)
+			first := c.Check(alloc, state, false)
+			require.Equal(t, []uint64{4}, commandsOf(first, pb.RemoveReplica))
+			require.Equal(t, []uint64{5}, commandsOf(first, pb.StartReplica))
+			var start *operator.Operator
+			for _, op := range c.OperatorController.GetOperators(1) {
+				for _, step := range op.OpSteps() {
+					if s, ok := step.(operator.StartLogService); ok && s.ReplicaID == 5 {
+						start = op
+					}
+				}
+			}
+			require.NotNil(t, start)
+			require.Equal(t, operator.STARTED, start.Status())
+			shard.Epoch++
+			delete(shard.Replicas, 4)
+			observe(false)
+			second := c.Check(alloc, state, false)
+			require.NotContains(t, commandsOf(second, pb.RemoveReplica), uint64(5))
+			require.Equal(t, operator.STARTED, start.Status())
+			if finish == "reported" {
+				observe(true)
+			} else {
+				start.SetStatus(operator.EXPIRED)
+			}
+			third := c.Check(alloc, state, false)
+			removed := commandsOf(third, pb.RemoveReplica)
+			require.Len(t, removed, 1, "removal can resume after the Start finishes")
+			if finish == "expired" {
+				require.Equal(t, uint64(5), removed[0], "the unreported voter is the safe removal")
+			}
+		})
+	}
+}
+
+func TestCoordinatorKeepsConflictingRemovalAtSameEpoch(t *testing.T) {
+	for _, release := range []string{"epoch", "expired"} {
+		t.Run(release, func(t *testing.T) {
+			c := NewCoordinator("", hakeeper.Config{})
+			shard := pb.LogShardInfo{ShardID: 1, Epoch: 7,
+				Replicas: map[uint64]string{1: "a", 2: "b", 3: "c", 4: "d"}}
+			state := pb.CheckerState{Tick: 1,
+				ClusterInfo: pb.ClusterInfo{LogShards: []metadata.LogShardRecord{{ShardID: 1, NumberOfReplicas: 3}}},
+				LogState:    pb.LogState{Shards: map[uint64]pb.LogShardInfo{1: shard}, Stores: map[string]pb.LogStoreInfo{"d": {Tick: 1}}},
+			}
+			for id, uuid := range map[uint64]string{1: "a", 2: "b", 3: "c"} {
+				state.LogState.Stores[uuid] = pb.LogStoreInfo{Tick: 1, Replicas: []pb.LogReplicaInfo{{LogShardInfo: shard, ReplicaID: id}}}
+			}
+			start := operator.CreateStartReplica("", "d", 1, 4)
+			remove := operator.NewOperator("", 1, 7, operator.RemoveLogService{
+				Target: "a", Replica: operator.Replica{UUID: "d", ShardID: 1, ReplicaID: 4, Epoch: 7},
+			})
+			c.OperatorController.Dispatch([]*operator.Operator{start, remove}, state.LogState, state.TNState, state.CNState, state.ProxyState)
+			store := state.LogState.Stores["a"]
+			store.Replicas = nil
+			state.LogState.Stores["a"] = store
+			commands := c.Check(util.NewTestIDAllocator(100), state, false)
+			require.Equal(t, operator.STARTED, remove.Status(), "a previously submitted removal remains owned at the same epoch")
+			require.Contains(t, c.OperatorController.GetOperators(1), remove)
+			for _, cmd := range commands {
+				if cmd.ConfigChange != nil && cmd.ConfigChange.Replica.ShardID == 1 && cmd.ConfigChange.Replica.ReplicaID == 4 {
+					require.NotEqual(t, pb.StartReplica, cmd.ConfigChange.ChangeType)
+					require.NotEqual(t, pb.RemoveReplica, cmd.ConfigChange.ChangeType)
+				}
+			}
+			if release == "epoch" {
+				shard.Epoch++
+				state.LogState.Shards[1] = shard
+				c.Check(util.NewTestIDAllocator(100), state, false)
+				require.Equal(t, operator.CANCELED, remove.Status(), "an advanced epoch fences the old ordered change")
+			} else {
+				remove.SetStatus(operator.EXPIRED)
+				c.Check(util.NewTestIDAllocator(100), state, false)
+				require.NotContains(t, c.OperatorController.GetOperators(1), remove)
+				require.Contains(t, c.OperatorController.GetOperators(1), start)
+			}
 		})
 	}
 }

@@ -250,7 +250,24 @@ func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 	waitForReport(4, true)
 	replacement := pb.ScheduleCommand{UUID: c.ID(), ServiceType: pb.LogService,
 		ConfigChange: &pb.ConfigChange{ChangeType: pb.StartReplica, Replica: pb.Replica{ShardID: 1, ReplicaID: 4, UUID: c.ID()}}}
-	c.handleCommands(ctx, []pb.ScheduleCommand{replacement})
+	stale := pb.ScheduleCommand{UUID: c.ID(), ServiceType: pb.LogService,
+		ConfigChange: &pb.ConfigChange{ChangeType: pb.StartReplica, Replica: pb.Replica{ShardID: 1, ReplicaID: 3, UUID: c.ID()}}}
+	require.Eventually(t, func() bool {
+		for _, service := range []*Service{a, b} {
+			leader, current, err := service.store.isLeaderHAKeeper()
+			if err == nil && leader {
+				term = current
+				return true
+			}
+		}
+		return false
+	}, 10*time.Second, 30*time.Millisecond)
+	_, err = a.store.nh.SyncPropose(ctx, a.store.nh.GetNoOPSession(0), hakeeper.GetUpdateCommandsCmd(term, []pb.ScheduleCommand{stale, replacement}))
+	require.NoError(t, err)
+	delivered, err := c.haClient.SendLogHeartbeat(ctx, c.store.getHeartbeatMessage())
+	require.NoError(t, err)
+	require.Equal(t, []pb.ScheduleCommand{replacement}, delivered.Commands, "a known retired ID must not hide a valid new member")
+	c.handleCommands(ctx, delivered.Commands)
 	require.Eventually(t, func() bool {
 		attempt, stop := context.WithTimeout(ctx, time.Second)
 		defer stop()

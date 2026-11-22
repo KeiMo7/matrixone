@@ -25,6 +25,7 @@ import (
 // legacy replacement batch. Reuse current checker candidates: unfinished alone
 // does not mean that an old configuration or storage incarnation is still valid.
 func PendingOperators(fields hakeeper.CheckerCommonFields, state pb.LogState,
+	executing, executingNonVoting operator.ExecutingReplicas,
 	nonVotingReplicaNum uint64, ops, newOps []*operator.Operator) []*operator.Operator {
 	working, expired := parseLogStores(fields.Cfg, state, fields.CurrentTick)
 	normal, nonVoting := parseLogShards(fields.Cluster, state, expired, nonVotingReplicaNum)
@@ -65,8 +66,7 @@ func PendingOperators(fields hakeeper.CheckerCommonFields, state pb.LogState,
 			default:
 				continue
 			}
-			replica.Epoch = 0
-			selectedRemovals[replica] = true
+			selectedRemovals[operator.Replica{ShardID: replica.ShardID, ReplicaID: replica.ReplicaID}] = true
 		}
 	}
 	authorized := func(r operator.Replica, target string, change pb.ConfigChangeType) bool {
@@ -93,12 +93,18 @@ func PendingOperators(fields hakeeper.CheckerCommonFields, state pb.LogState,
 		if role == 1 {
 			change = pb.RemoveNonVotingReplica
 		}
+		if replicaIsStarting(executing, executingNonVoting, r.ShardID, r.ReplicaID) {
+			// The previous removal may already be in flight. Do not resend
+			// either side of the conflict while both operators are owned.
+			selectedRemovals[operator.Replica{ShardID: r.ShardID, ReplicaID: r.ReplicaID}] = true
+			return false
+		}
 		if _, scheduled := membershipScheduled[r.ShardID]; scheduled ||
 			!removes[role][key] || !authorized(r, target, change) {
 			return false
 		}
 		membershipScheduled[r.ShardID] = struct{}{}
-		selectedRemovals[key] = true
+		selectedRemovals[operator.Replica{ShardID: r.ShardID, ReplicaID: r.ReplicaID}] = true
 		return true
 	}
 	var pending []*operator.Operator
@@ -153,6 +159,6 @@ func PendingOperators(fields hakeeper.CheckerCommonFields, state pb.LogState,
 	}
 	return slices.DeleteFunc(pending, func(op *operator.Operator) bool {
 		replica, isStart := startsByOperator[op]
-		return isStart && selectedRemovals[replica]
+		return isStart && selectedRemovals[operator.Replica{ShardID: replica.ShardID, ReplicaID: replica.ReplicaID}]
 	})
 }

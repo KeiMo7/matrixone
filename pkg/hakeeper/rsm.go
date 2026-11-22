@@ -493,6 +493,10 @@ func (s *stateMachine) handleUpdateCommandsCmd(cmd []byte) sm.Result {
 }
 
 func (s *stateMachine) getCommandBatch(uuid string) sm.Result {
+	return s.getCommandBatchFiltered(uuid, false)
+}
+
+func (s *stateMachine) getCommandBatchFiltered(uuid string, filterLogStarts bool) sm.Result {
 	if batch, ok := s.state.ScheduleCommands[uuid]; ok {
 		deliver := make([]pb.ScheduleCommand, 0, len(batch.Commands))
 		pending := make([]pb.ScheduleCommand, 0, len(batch.Commands))
@@ -501,7 +505,9 @@ func (s *stateMachine) getCommandBatch(uuid string) sm.Result {
 			if applied {
 				continue
 			}
-			deliver = append(deliver, cmd)
+			if !filterLogStarts || s.logStartDeliverable(uuid, cmd) {
+				deliver = append(deliver, cmd)
+			}
 			if retryable {
 				pending = append(pending, cmd)
 			}
@@ -599,7 +605,25 @@ func (s *stateMachine) handleLogHeartbeat(cmd []byte) sm.Result {
 		panic(err)
 	}
 	s.state.LogState.Update(hb, s.state.Tick)
-	return s.getCommandBatch(hb.UUID)
+	return s.getCommandBatchFiltered(hb.UUID, true)
+}
+
+// logStartDeliverable checks ordinary starts against the state committed by
+// this heartbeat. Queue consumption and bootstrap retry are unchanged.
+func (s *stateMachine) logStartDeliverable(uuid string, command pb.ScheduleCommand) bool {
+	change := command.ConfigChange
+	if command.ServiceType != pb.LogService || change == nil || command.Bootstrapping ||
+		(change.ChangeType != pb.StartReplica && change.ChangeType != pb.StartNonVotingReplica) {
+		return true
+	}
+	replica := change.Replica
+	shard, ok := s.state.LogState.Shards[replica.ShardID]
+	members := shard.Replicas
+	if change.ChangeType == pb.StartNonVotingReplica {
+		members = shard.NonVotingReplicas
+	}
+	member, exists := members[replica.ReplicaID]
+	return ok && uuid != "" && command.UUID == uuid && replica.UUID == uuid && exists && member == uuid
 }
 
 func (s *stateMachine) handleTick(cmd []byte) sm.Result {

@@ -1303,4 +1303,15 @@ func TestCheckerDoesNotStartSelectedSurplusRemoval(t *testing.T) {
 	}
 	assert.Equal(t, []uint64{4}, removed)
 	assert.Equal(t, []uint64{5}, started)
+
+	checker = NewLogServiceChecker(fields, state, pb.TNState{},
+		operator.ExecutingReplicas{Starting: map[uint64][]uint64{1: {5}}},
+		operator.ExecutingReplicas{}, 0, pb.Locality{}, false)
+	removed = nil
+	for _, op := range checker.Check() {
+		if step, ok := op.OpSteps()[0].(operator.RemoveLogService); ok {
+			removed = append(removed, step.ReplicaID)
+		}
+	}
+	assert.Equal(t, []uint64{4}, removed, "an independent safe removal still proceeds")
 }
