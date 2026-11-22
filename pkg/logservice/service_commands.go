@@ -39,23 +39,16 @@ func (s *Service) handleCommands(ctx context.Context, cmds []pb.ScheduleCommand)
 	var membership []pb.ScheduleCommand
 	var stopping map[uint64]bool
 	for _, cmd := range cmds {
-		if change := cmd.GetConfigChange(); change != nil {
-			switch change.ChangeType {
-			case pb.StopReplica, pb.StopNonVotingReplica, pb.KillZombie:
-				if stopping == nil {
-					stopping = make(map[uint64]bool)
-				}
-				stopping[change.Replica.ShardID] = true
+		if change := cmd.GetConfigChange(); isReplicaCleanup(change) {
+			if stopping == nil {
+				stopping = make(map[uint64]bool)
 			}
+			stopping[change.Replica.ShardID] = true
 		}
 	}
 	for _, cmd := range cmds {
-		if ctx.Err() != nil {
-			return
-		}
 		change := cmd.GetConfigChange()
-		if cmd.BootstrapShard != nil {
-			s.handleBootstrapShard(cmd)
+		if ctx.Err() != nil && !isReplicaCleanup(change) {
 			continue
 		}
 		if change != nil && isMembershipChange(change) {
@@ -67,6 +60,9 @@ func (s *Service) handleCommands(ctx context.Context, cmds []pb.ScheduleCommand)
 			continue
 		}
 		s.runtime.Logger().Info(fmt.Sprintf("%s applying cmd: %s", s.ID(), cmd.LogString()))
+		if ctx.Err() != nil && !isReplicaCleanup(change) {
+			continue
+		}
 		if change != nil {
 			s.runtime.Logger().Debug("applying schedule command:", zap.String("command", cmd.LogString()))
 			switch cmd.ConfigChange.ChangeType {
@@ -91,6 +87,8 @@ func (s *Service) handleCommands(ctx context.Context, cmds []pb.ScheduleCommand)
 			s.createSQLLogger(cmd.CreateTaskService)
 		} else if cmd.GetAddLogShard() != nil {
 			s.handleAddLogShard(cmd)
+		} else if cmd.GetBootstrapShard() != nil {
+			s.handleBootstrapShard(cmd)
 		} else {
 			panic(fmt.Sprintf("unknown schedule command type: %+v", cmd))
 		}
@@ -133,6 +131,18 @@ func (s *Service) handleCommands(ctx context.Context, cmds []pb.ScheduleCommand)
 			s.handleRemoveReplica(cmd)
 		}
 		validation.charge(time.Since(started))
+	}
+}
+
+func isReplicaCleanup(change *pb.ConfigChange) bool {
+	if change == nil {
+		return false
+	}
+	switch change.ChangeType {
+	case pb.StopReplica, pb.StopNonVotingReplica, pb.KillZombie:
+		return true
+	default:
+		return false
 	}
 }
 

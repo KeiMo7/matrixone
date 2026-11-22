@@ -17,6 +17,7 @@ package logservice
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,13 +27,82 @@ import (
 	"github.com/lni/vfs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 
 	"github.com/matrixorigin/matrixone/pkg/common/morpc"
 	"github.com/matrixorigin/matrixone/pkg/common/runtime"
 	pb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
+	"github.com/matrixorigin/matrixone/pkg/pb/metadata"
 )
+
+type cancelAfterHeartbeatClient struct {
+	LogHAKeeperClient
+	cancel   context.CancelFunc
+	commands []pb.ScheduleCommand
+	sent     bool
+}
+
+func (c *cancelAfterHeartbeatClient) Close() error { return nil }
+
+func (c *cancelAfterHeartbeatClient) SendLogHeartbeat(context.Context, pb.LogStoreHeartbeat) (pb.CommandBatch, error) {
+	c.sent = true
+	c.cancel()
+	return pb.CommandBatch{Commands: c.commands}, nil
+}
+
+func TestScheduleCancellationStillProcessesLaterStop(t *testing.T) {
+	for _, dynamic := range []bool{false, true} {
+		name := "start"
+		if dynamic {
+			name = "dynamic bootstrap"
+		}
+		t.Run(name, func(t *testing.T) {
+			runServiceTest(t, false, true, func(t *testing.T, s *Service) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				logger := zap.NewExample(zap.Hooks(func(entry zapcore.Entry) error {
+					if strings.Contains(entry.Message, " applying cmd: ") {
+						cancel()
+					}
+					return nil
+				}))
+				s.runtime = runtime.NewRuntime(metadata.ServiceType_LOG, s.ID(), logger)
+				start := pb.ScheduleCommand{UUID: s.ID(), ConfigChange: &pb.ConfigChange{ChangeType: pb.StartReplica,
+					Replica: pb.Replica{UUID: s.ID(), ShardID: 2, ReplicaID: 2}}}
+				if dynamic {
+					start.ConfigChange = nil
+					start.BootstrapShard = &pb.BootstrapShard{ShardID: 2, ReplicaID: 2, InitialMembers: map[uint64]string{2: s.ID()}}
+				}
+				stop := pb.ScheduleCommand{UUID: s.ID(), ConfigChange: &pb.ConfigChange{ChangeType: pb.StopReplica,
+					Replica: pb.Replica{UUID: s.ID(), ShardID: 1, ReplicaID: 1}}}
+				present := func() bool {
+					for _, replica := range s.store.nh.GetNodeHostInfo(dragonboat.NodeHostInfoOption{SkipLogInfo: true}).ShardInfoList {
+						if replica.ShardID == 1 && replica.ReplicaID == 1 {
+							return true
+						}
+					}
+					return false
+				}
+				require.True(t, present())
+				if dynamic {
+					client := &cancelAfterHeartbeatClient{cancel: cancel, commands: []pb.ScheduleCommand{start, stop}}
+					s.haClient = client
+					s.heartbeat(ctx)
+					require.True(t, client.sent, "the late heartbeat returned the batch")
+				} else {
+					s.handleCommands(ctx, []pb.ScheduleCommand{start, stop})
+				}
+				require.ErrorIs(t, ctx.Err(), context.Canceled)
+				require.False(t, s.store.nh.HasNodeInfo(2, 2), "canceled admission must not create a replica")
+				require.Eventually(t, func() bool { return !present() }, 5*time.Second, 20*time.Millisecond,
+					"the already delivered independent Stop must still run")
+			})
+		})
+	}
+}
 
 func TestBackgroundTickAndHeartbeat(t *testing.T) {
 	runtime.RunTest(
