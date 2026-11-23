@@ -36,7 +36,7 @@ func TestDynamicBootstrapSurvivesLegacyScheduleReplacement(t *testing.T) {
 
 	var configs [3]Config
 	var services [3]*Service
-	var seeds []string
+	seeds := make([]string, 0, len(configs))
 	for i := range configs {
 		configs[i] = getServiceTestConfig()
 		configs[i].RTTMillisecond = 100
