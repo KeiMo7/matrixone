@@ -35,12 +35,38 @@ import (
 func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
+	// Run readiness probes in this goroutine so none can outlive a failed
+	// phase and race with service cleanup.
+	wait := func(phase string, timeout, interval time.Duration, probe func(context.Context) error) {
+		t.Helper()
+		phaseCtx, stop := context.WithTimeout(ctx, timeout)
+		defer stop()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		var lastErr error
+		for {
+			if err := phaseCtx.Err(); err != nil {
+				t.Fatalf("%s: %v; last observation: %v", phase, err, lastErr)
+			}
+			lastErr = probe(phaseCtx)
+			if lastErr == nil {
+				return
+			}
+			select {
+			case <-phaseCtx.Done():
+				t.Fatalf("%s: %v; last observation: %v", phase, phaseCtx.Err(), lastErr)
+			case <-ticker.C:
+			}
+		}
+	}
 	var configs [3]Config
 	var services [3]*Service
 	members := make(map[uint64]string)
 	seeds := make([]string, 0, len(configs))
 	for i := range configs {
 		configs[i] = getServiceTestConfig()
+		// Keep election timeouts above the scheduling delays seen in a race suite.
+		configs[i].RTTMillisecond = 100
 		configs[i].DataDir = t.TempDir()
 		configs[i].SnapshotExportDir = filepath.Join(configs[i].DataDir, "exported-snapshot")
 		configs[i].FS = vfs.Default
@@ -64,25 +90,19 @@ func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 	}
 	connect := func(s *Service) LogHAKeeperClient {
 		t.Helper()
-		connectCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		defer cancel()
-		ticker := time.NewTicker(50 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			attempt, stop := context.WithTimeout(connectCtx, time.Second)
-			client, err := NewLogHAKeeperClient(attempt, s.ID(), configs[2].GetHAKeeperClientConfig())
+		var client LogHAKeeperClient
+		wait("connect to HAKeeper for "+s.ID(), 10*time.Second, 50*time.Millisecond, func(phaseCtx context.Context) error {
+			attempt, stop := context.WithTimeout(phaseCtx, time.Second)
+			candidate, err := NewLogHAKeeperClient(attempt, s.ID(), configs[2].GetHAKeeperClientConfig())
 			stop()
-			if err == nil {
-				t.Cleanup(func() { require.NoError(t, client.Close()) })
-				return client
+			if err != nil {
+				return err
 			}
-			select {
-			case <-connectCtx.Done():
-				t.Fatalf("cannot connect to HAKeeper: %v", err)
-				return nil
-			case <-ticker.C:
-			}
-		}
+			t.Cleanup(func() { require.NoError(t, candidate.Close()) })
+			client = candidate
+			return nil
+		})
+		return client
 	}
 	for i := range configs {
 		open(i)
@@ -93,54 +113,57 @@ func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 		})
 	}
 	// The two initial voters need each other's Raft addresses before election.
-	require.Eventually(t, func() bool {
+	wait("initial voters discover each other", 10*time.Second, 30*time.Millisecond, func(context.Context) error {
 		for i := 0; i < 2; i++ {
 			registry, ok := services[i].store.nh.GetNodeHostRegistry()
 			if !ok {
-				return false
+				return fmt.Errorf("store %s has no registry", services[i].ID())
 			}
 			peer := 1 - i
 			meta, ok := registry.GetMeta(services[peer].ID())
 			if !ok || string(meta) != configs[peer].LogServiceServiceAddr() {
-				return false
+				return fmt.Errorf("store %s has not discovered %s", services[i].ID(), services[peer].ID())
 			}
 		}
-		return true
-	}, 10*time.Second, 30*time.Millisecond, "initial voters must discover each other")
+		return nil
+	})
 	initialMembers := map[uint64]string{1: members[1], 2: members[2]}
 	for i := 0; i < 2; i++ {
 		require.NoError(t, services[i].store.startHAKeeperReplica(uint64(i+1), initialMembers, false))
 	}
-	// C is a previously joined voter, so this also exercises the released
-	// branch's ordinary join=true restart path as a regression control.
-	var initial *dragonboat.Membership
-	require.Eventually(t, func() bool {
-		attempt, stop := context.WithTimeout(ctx, 300*time.Millisecond)
-		defer stop()
-		var err error
-		initial, err = services[0].store.nh.SyncGetShardMembership(attempt, 0)
-		return err == nil && len(initial.Nodes) == 2
-	}, 12*time.Second, 30*time.Millisecond)
-	require.NoError(t, services[0].store.nh.SyncRequestAddReplica(ctx, 0, 3, services[2].ID(), initial.ConfigChangeID))
-	require.NoError(t, services[2].store.startHAKeeperReplica(3, nil, true))
-	readMembership := func(s *Service, shard uint64) *dragonboat.Membership {
+	readMembership := func(s *Service, shard uint64, expected map[uint64]string) *dragonboat.Membership {
 		t.Helper()
 		var membership *dragonboat.Membership
-		require.Eventually(t, func() bool {
-			attempt, stop := context.WithTimeout(ctx, 300*time.Millisecond)
-			defer stop()
-			var err error
-			membership, err = s.store.nh.SyncGetShardMembership(attempt, shard)
-			return err == nil && len(membership.Nodes) == 3
-		}, 12*time.Second, 30*time.Millisecond)
+		phase := fmt.Sprintf("membership of shard %d on %s (want %v)", shard, s.ID(), expected)
+		wait(phase, 12*time.Second, 30*time.Millisecond, func(phaseCtx context.Context) error {
+			attempt, stop := context.WithTimeout(phaseCtx, time.Second)
+			observed, err := s.store.nh.SyncGetShardMembership(attempt, shard)
+			stop()
+			if err != nil {
+				if membership != nil {
+					return fmt.Errorf("last members %v at config %d; read failed: %w", membership.Nodes, membership.ConfigChangeID, err)
+				}
+				return err
+			}
+			membership = observed
+			if !maps.Equal(observed.Nodes, expected) {
+				return fmt.Errorf("observed members %v at config %d", observed.Nodes, observed.ConfigChangeID)
+			}
+			return nil
+		})
 		return membership
 	}
+	// C is a previously joined voter, so this also exercises the released
+	// branch's ordinary join=true restart path as a regression control.
+	initial := readMembership(services[0], 0, initialMembers)
+	require.NoError(t, services[0].store.nh.SyncRequestAddReplica(ctx, 0, 3, services[2].ID(), initial.ConfigChangeID))
+	require.NoError(t, services[2].store.startHAKeeperReplica(3, nil, true))
 	a, b, c := services[0], services[1], services[2]
-	require.Equal(t, members, readMembership(c, 0).Nodes)
+	readMembership(c, 0, members)
 	for i := range services {
 		require.NoError(t, services[i].store.startReplica(1, uint64(i+1), members, false))
 	}
-	readMembership(a, 1)
+	readMembership(a, 1, members)
 	localHAID := atomic.LoadUint64(&a.store.haKeeperReplicaID)
 	require.Error(t, a.store.stopReplica(0, localHAID+100))
 	require.Equal(t, localHAID, atomic.LoadUint64(&a.store.haKeeperReplicaID), "a failed stop must not clear the live HAKeeper ID")
@@ -148,55 +171,38 @@ func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 	// Before installing test commands, wait for a stable leader and committed
 	// reports from all data voters. A successful client connection alone does
 	// not imply that the first heartbeat can be committed.
-	readyCtx, readyCancel := context.WithTimeout(ctx, 12*time.Second)
-	readyTicker := time.NewTicker(50 * time.Millisecond)
-	for {
-		var readyErr error
+	wait("initial committed data heartbeats", 12*time.Second, 50*time.Millisecond, func(phaseCtx context.Context) error {
 		for _, service := range services {
-			attempt, stop := context.WithTimeout(readyCtx, time.Second)
-			_, readyErr = client.SendLogHeartbeat(attempt, service.store.getHeartbeatMessage())
+			attempt, stop := context.WithTimeout(phaseCtx, time.Second)
+			_, err := client.SendLogHeartbeat(attempt, service.store.getHeartbeatMessage())
 			stop()
-			if readyErr != nil {
-				break
+			if err != nil {
+				return fmt.Errorf("heartbeat from %s: %w", service.ID(), err)
 			}
 		}
-		if readyErr == nil {
-			attempt, stop := context.WithTimeout(readyCtx, time.Second)
-			state, err := client.GetClusterState(attempt)
-			stop()
-			readyErr = err
-			if readyErr == nil && !maps.Equal(members, state.LogState.Shards[1].Replicas) {
-				readyErr = fmt.Errorf("unexpected data membership: %v", state.LogState.Shards[1].Replicas)
-			}
-			if readyErr == nil {
-				for id, uuid := range members {
-					found := false
-					for _, replica := range state.LogState.Stores[uuid].Replicas {
-						if replica.ShardID == 1 && replica.ReplicaID == id && !replica.IsNonVoting {
-							found = true
-							break
-						}
-					}
-					if !found {
-						readyErr = fmt.Errorf("missing data voter %d on %s", id, uuid)
-						break
-					}
+		attempt, stop := context.WithTimeout(phaseCtx, time.Second)
+		state, err := client.GetClusterState(attempt)
+		stop()
+		if err != nil {
+			return err
+		}
+		if !maps.Equal(members, state.LogState.Shards[1].Replicas) {
+			return fmt.Errorf("unexpected data membership: %v", state.LogState.Shards[1].Replicas)
+		}
+		for id, uuid := range members {
+			found := false
+			for _, replica := range state.LogState.Stores[uuid].Replicas {
+				if replica.ShardID == 1 && replica.ReplicaID == id && !replica.IsNonVoting {
+					found = true
+					break
 				}
 			}
+			if !found {
+				return fmt.Errorf("missing data voter %d on %s", id, uuid)
+			}
 		}
-		if readyErr == nil {
-			break
-		}
-		select {
-		case <-readyCtx.Done():
-			readyTicker.Stop()
-			readyCancel()
-			t.Fatalf("initial committed data heartbeats did not become ready: %v", readyErr)
-		case <-readyTicker.C:
-		}
-	}
-	readyTicker.Stop()
-	readyCancel()
+		return nil
+	})
 	old, err := a.store.nh.SyncPropose(ctx, a.store.nh.GetNoOPSession(1), getTestUserEntry())
 	require.NoError(t, err)
 
@@ -213,17 +219,22 @@ func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 	c.haClient = client
 	controlStart := pb.ScheduleCommand{UUID: c.ID(), ServiceType: pb.LogService,
 		ConfigChange: &pb.ConfigChange{ChangeType: pb.StartReplica, Replica: pb.Replica{ShardID: 0, ReplicaID: 3, UUID: c.ID()}}}
-	var term uint64
-	require.Eventually(t, func() bool {
-		for _, s := range []*Service{a, b} {
-			leader, current, err := s.store.isLeaderHAKeeper()
-			if err == nil && leader {
-				term = current
-				return true
+	readLeaderTerm := func() uint64 {
+		t.Helper()
+		var term uint64
+		wait("find a HAKeeper leader", 10*time.Second, 30*time.Millisecond, func(context.Context) error {
+			for _, service := range []*Service{a, b} {
+				leader, current, err := service.store.isLeaderHAKeeper()
+				if err == nil && leader {
+					term = current
+					return nil
+				}
 			}
-		}
-		return false
-	}, 10*time.Second, 30*time.Millisecond)
+			return fmt.Errorf("neither surviving store reports the HAKeeper leader")
+		})
+		return term
+	}
+	term := readLeaderTerm()
 	_, err = a.store.nh.SyncPropose(ctx, a.store.nh.GetNoOPSession(0), hakeeper.GetUpdateCommandsCmd(term, []pb.ScheduleCommand{controlStart}))
 	require.NoError(t, err)
 	batch, err := client.SendLogHeartbeat(ctx, c.store.getHeartbeatMessage())
@@ -236,7 +247,7 @@ func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 	stop()
 	require.Error(t, err, "one control voter cannot authorize its own recovery")
 	c.handleCommands(ctx, batch.Commands)
-	readMembership(c, 0)
+	readMembership(c, 0, members)
 	_, err = c.haClient.SendLogHeartbeat(ctx, c.store.getHeartbeatMessage())
 	require.NoError(t, err, "the restored control quorum must accept replicated writes")
 
@@ -254,7 +265,7 @@ func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 	_, err = a.store.nh.SyncPropose(attempt, a.store.nh.GetNoOPSession(1), getTestUserEntry())
 	stop()
 	require.Error(t, err, "one surviving data voter must not commit")
-	readMembership(c, 0)
+	readMembership(c, 0, members)
 	c.haClient = connect(c)
 	_, err = c.haClient.SendLogHeartbeat(ctx, c.store.getHeartbeatMessage())
 	require.NoError(t, err)
@@ -262,29 +273,41 @@ func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 		ConfigChange: &pb.ConfigChange{ChangeType: pb.StartReplica, Replica: pb.Replica{ShardID: 1, ReplicaID: 3, UUID: c.ID()}}}
 	shutdown := pb.ScheduleCommand{UUID: c.ID(), ServiceType: pb.LogService, ShutdownStore: &pb.ShutdownStore{StoreID: c.ID()}}
 	c.handleCommands(context.Background(), []pb.ScheduleCommand{shutdown, start})
-	readMembership(c, 1)
+	readMembership(c, 1, members)
 	var next uint64
-	require.Eventually(t, func() bool {
-		attempt, stop := context.WithTimeout(ctx, 500*time.Millisecond)
-		defer stop()
+	wait("write after data quorum recovery", 10*time.Second, 30*time.Millisecond, func(phaseCtx context.Context) error {
+		attempt, stop := context.WithTimeout(phaseCtx, 500*time.Millisecond)
 		result, err := a.store.nh.SyncPropose(attempt, a.store.nh.GetNoOPSession(1), getTestUserEntry())
+		stop()
+		if err != nil {
+			return err
+		}
 		next = result.Value
-		return err == nil && next > old.Value
-	}, 10*time.Second, 30*time.Millisecond)
-	require.Eventually(t, func() bool {
-		attempt, stop := context.WithTimeout(ctx, 300*time.Millisecond)
-		defer stop()
+		if next <= old.Value {
+			return fmt.Errorf("write index %d has not advanced past %d", next, old.Value)
+		}
+		return nil
+	})
+	wait("recovered voter catches up", 10*time.Second, 30*time.Millisecond, func(phaseCtx context.Context) error {
+		attempt, stop := context.WithTimeout(phaseCtx, 300*time.Millisecond)
 		lsn, err := c.store.getLatestLsn(attempt, 1)
-		return err == nil && lsn >= next
-	}, 10*time.Second, 30*time.Millisecond)
+		stop()
+		if err != nil {
+			return err
+		}
+		if lsn < next {
+			return fmt.Errorf("LSN %d has not reached %d", lsn, next)
+		}
+		return nil
+	})
 
 	// After removal, a replacement identity can join the same real Raft group.
 	open(1)
 	b = services[1]
-	readMembership(b, 1)
+	readMembership(b, 1, members)
 	require.NoError(t, c.Close())
 	services[2] = nil
-	beforeRemove := readMembership(a, 1)
+	beforeRemove := readMembership(a, 1, members)
 	require.NoError(t, a.store.nh.SyncRequestDeleteReplica(ctx, 1, 3, beforeRemove.ConfigChangeID))
 	configs[2].DataDir = t.TempDir()
 	configs[2].SnapshotExportDir = filepath.Join(configs[2].DataDir, "exported-snapshot")
@@ -294,22 +317,26 @@ func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 	waitForReport := func(id uint64, present bool) pb.LogShardInfo {
 		t.Helper()
 		var observed pb.LogShardInfo
-		require.Eventually(t, func() bool {
-			attempt, stop := context.WithTimeout(ctx, time.Second)
+		phase := fmt.Sprintf("replica %d present=%t in committed data reports", id, present)
+		wait(phase, 10*time.Second, 30*time.Millisecond, func(phaseCtx context.Context) error {
+			attempt, stop := context.WithTimeout(phaseCtx, time.Second)
 			defer stop()
 			for _, service := range []*Service{a, b} {
 				if _, err := c.haClient.SendLogHeartbeat(attempt, service.store.getHeartbeatMessage()); err != nil {
-					return false
+					return err
 				}
 			}
 			state, err := c.haClient.GetLogScheduleState(attempt, 1, c.ID())
 			if err != nil {
-				return false
+				return err
 			}
 			observed = state.LogState.Shards[1]
 			_, exists := observed.Replicas[id]
-			return observed.Epoch > beforeRemove.ConfigChangeID && exists == present
-		}, 10*time.Second, 30*time.Millisecond)
+			if observed.Epoch <= beforeRemove.ConfigChangeID || exists != present {
+				return fmt.Errorf("epoch %d, members %v; want epoch > %d and replica present=%t", observed.Epoch, observed.Replicas, beforeRemove.ConfigChangeID, present)
+			}
+			return nil
+		})
 		return observed
 	}
 	afterRemove := waitForReport(3, false)
@@ -319,28 +346,15 @@ func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 		ConfigChange: &pb.ConfigChange{ChangeType: pb.StartReplica, Replica: pb.Replica{ShardID: 1, ReplicaID: 4, UUID: c.ID()}}}
 	stale := pb.ScheduleCommand{UUID: c.ID(), ServiceType: pb.LogService,
 		ConfigChange: &pb.ConfigChange{ChangeType: pb.StartReplica, Replica: pb.Replica{ShardID: 1, ReplicaID: 3, UUID: c.ID()}}}
-	require.Eventually(t, func() bool {
-		for _, service := range []*Service{a, b} {
-			leader, current, err := service.store.isLeaderHAKeeper()
-			if err == nil && leader {
-				term = current
-				return true
-			}
-		}
-		return false
-	}, 10*time.Second, 30*time.Millisecond)
+	term = readLeaderTerm()
 	_, err = a.store.nh.SyncPropose(ctx, a.store.nh.GetNoOPSession(0), hakeeper.GetUpdateCommandsCmd(term, []pb.ScheduleCommand{stale, replacement}))
 	require.NoError(t, err)
 	delivered, err := c.haClient.SendLogHeartbeat(ctx, c.store.getHeartbeatMessage())
 	require.NoError(t, err)
 	require.Equal(t, []pb.ScheduleCommand{replacement}, delivered.Commands, "a known retired ID must not hide a valid new member")
 	c.handleCommands(ctx, delivered.Commands)
-	require.Eventually(t, func() bool {
-		attempt, stop := context.WithTimeout(ctx, time.Second)
-		defer stop()
-		membership, err := c.store.nh.SyncGetShardMembership(attempt, 1)
-		return err == nil && membership.Nodes[4] == c.ID()
-	}, 10*time.Second, 30*time.Millisecond, "the replacement must join the current group")
+	replacementMembers := map[uint64]string{1: a.ID(), 2: b.ID(), 4: c.ID()}
+	readMembership(c, 1, replacementMembers)
 
 	// Dynamic bootstrap commands are one-shot. They must carry the same full
 	// initial membership to all three nodes even when validation is unavailable.
@@ -355,7 +369,7 @@ func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 		service.haClient = previous
 		require.Zero(t, client.calls)
 	}
-	readMembership(a, 2)
+	readMembership(a, 2, dynamicMembers)
 	_, err = a.store.nh.SyncPropose(ctx, a.store.nh.GetNoOPSession(2), getTestUserEntry())
 	require.NoError(t, err, "a one-shot dynamic bootstrap must form a writable three-node group")
 }
