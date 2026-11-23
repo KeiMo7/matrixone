@@ -74,14 +74,8 @@ func parseLogShards(
 	normalStats, nonVotingStats := newStats(false), newStats(true)
 	for _, shardInfo := range infos.Shards {
 		shardID := shardInfo.ShardID
-		record := logreplicas.RecordForShard(shardID, cluster.LogShards)
-		fixingNormal, fixingNonVoting := logreplicas.Repair(record, nonVotingReplicaNum, shardInfo, expired, infos.Stores)
-
-		// cal the toRemove field.
-		toRemoveNormal := getReplicasToRemove(shardID, shardInfo.Replicas, fixingNormal.Replicas)
-		toRemoveNonVoting := getReplicasToRemove(shardID, shardInfo.NonVotingReplicas, fixingNonVoting.Replicas)
-
-		// cal the toStart field.
+		// Existing replica starts are independent of membership reconfiguration.
+		// A report alone is not authority to add or remove shard members.
 		toStartNormal := getReplicasToStart(
 			shardID,
 			shardInfo.Replicas,
@@ -95,6 +89,16 @@ func parseLogShards(
 			infos.Stores,
 		)
 
+		normalStats.toStart = append(normalStats.toStart, toStartNormal...)
+		nonVotingStats.toStart = append(nonVotingStats.toStart, toStartNonVoting...)
+		record, known := logreplicas.RecordForShard(shardID, cluster.LogShards)
+		if !known || record.NumberOfReplicas == 0 {
+			continue
+		}
+		fixingNormal, fixingNonVoting := logreplicas.Repair(record, nonVotingReplicaNum, shardInfo, expired, infos.Stores)
+		toRemoveNormal := getReplicasToRemove(shardID, shardInfo.Replicas, fixingNormal.Replicas)
+		toRemoveNonVoting := getReplicasToRemove(shardID, shardInfo.NonVotingReplicas, fixingNonVoting.Replicas)
+
 		if fixingNormal.ToAdd > 0 {
 			normalStats.toAdd[shardID] = fixingNormal.ToAdd
 		}
@@ -107,8 +111,6 @@ func parseLogShards(
 		if len(toRemoveNonVoting) > 0 {
 			nonVotingStats.toRemove[shardID] = toRemoveNonVoting
 		}
-		normalStats.toStart = append(normalStats.toStart, toStartNormal...)
-		nonVotingStats.toStart = append(nonVotingStats.toStart, toStartNonVoting...)
 	}
 	// Check zombies
 	for uuid, storeInfo := range infos.Stores {

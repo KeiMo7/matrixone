@@ -392,6 +392,7 @@ func TestServiceHandleLogHeartbeat(t *testing.T) {
 	fn := func(t *testing.T, s *Service) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		require.NoError(t, s.store.setInitialClusterInfo(1, 1, 2, hapkg.K8SIDRangeEnd+10, nil, nil))
 		commitTestHAKeeperPolicy(t, ctx, s.store)
 
 		req := pb.Request{
@@ -439,7 +440,7 @@ func TestServiceHandleLogHeartbeat(t *testing.T) {
 		require.Empty(t, s.store.hakeeperCheckWakeup)
 
 		// Heartbeat delivery uses the committed timeout and current reports.
-		shard := pb.LogShardInfo{ShardID: 17, Epoch: 7, Replicas: map[uint64]string{1: "a", 2: "b", 3: "c"}}
+		shard := pb.LogShardInfo{ShardID: 17, Epoch: 7, Term: 1, LeaderID: 1, Replicas: map[uint64]string{1: "a", 2: "b", 3: "c"}}
 		heartbeat := func(uuid string, replica uint64) pb.CommandBatch {
 			t.Helper()
 			hb := pb.LogStoreHeartbeat{UUID: uuid}
@@ -451,6 +452,7 @@ func TestServiceHandleLogHeartbeat(t *testing.T) {
 			return batch
 		}
 		heartbeat("a", 1)
+		require.NoError(t, s.store.addLogShard(ctx, pb.AddLogShard{ShardID: 17}))
 		heartbeat("c", 3)
 		remove := pb.ScheduleCommand{UUID: "a", ServiceType: pb.LogService, ConfigChange: &pb.ConfigChange{
 			ChangeType: pb.RemoveReplica, Replica: pb.Replica{UUID: "b", ShardID: 17, ReplicaID: 2, Epoch: 7},
@@ -749,7 +751,11 @@ func TestServiceCommandDeliveryActivationWaitsForPendingHAKeeperAdmission(t *tes
 	fn := func(t *testing.T, s *Service) {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
+		require.NoError(t, s.store.setInitialClusterInfo(1, 1, 1, hapkg.K8SIDRangeEnd+10, nil, nil))
 		commitTestHAKeeperPolicy(t, ctx, s.store)
+		session := s.store.nh.GetNoOPSession(hapkg.DefaultHAKeeperShardID)
+		_, err := s.store.propose(ctx, session, hapkg.GetUpdateNonVotingReplicaNumCmd(1))
+		require.NoError(t, err)
 
 		heartbeat := func(uuid string, supported bool) pb.Response {
 			message := pb.LogStoreHeartbeat{

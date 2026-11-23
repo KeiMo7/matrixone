@@ -18,6 +18,7 @@ import (
 	"slices"
 
 	"github.com/matrixorigin/matrixone/pkg/hakeeper"
+	"github.com/matrixorigin/matrixone/pkg/hakeeper/logreplicas"
 	"github.com/matrixorigin/matrixone/pkg/hakeeper/operator"
 	pb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
 )
@@ -27,7 +28,7 @@ import (
 // does not mean that an old configuration or storage incarnation is still valid.
 func PendingOperators(fields hakeeper.CheckerCommonFields, state pb.LogState,
 	executing, executingNonVoting operator.ExecutingReplicas,
-	nonVotingReplicaNum uint64, ops, newOps []*operator.Operator) []*operator.Operator {
+	nonVotingReplicaNum uint64, nonVotingLocality pb.Locality, ops, newOps []*operator.Operator) []*operator.Operator {
 	working, expired := parseLogStores(fields.Cfg, state, fields.CurrentTick)
 	normal, nonVoting := parseLogShards(fields.Cluster, state, expired, nonVotingReplicaNum)
 	starts := [2]map[operator.Replica]bool{}
@@ -59,10 +60,11 @@ func PendingOperators(fields hakeeper.CheckerCommonFields, state pb.LogState,
 		if additions[role][r.ShardID] == 0 || !live(r.UUID) || !live(target) {
 			return false
 		}
-		if !eligible(r, target, change) {
-			return false
+		locality := pb.Locality{}
+		if role == 1 {
+			locality = nonVotingLocality
 		}
-		return true
+		return logreplicas.EligibleLocality(working[r.UUID], locality) && eligible(r, target, change)
 	}
 	remove := func(role int, r operator.Replica, target string, change pb.ConfigChangeType) bool {
 		key := r

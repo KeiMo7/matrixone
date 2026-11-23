@@ -2565,6 +2565,9 @@ func (g *checkWakeupGate) Check(_ util.IDAllocator, _ pb.CheckerState, _ bool) [
 func TestHAKeeperCheckWakeupRechecksDuringActiveCheck(t *testing.T) {
 	runManualHAKeeperStoreTest(t, false, func(t *testing.T, l *store) {
 		proceedHAKeeperToRunning(t, l)
+		policyCtx, cancelPolicy := context.WithTimeout(context.Background(), testIOTimeout)
+		commitTestHAKeeperPolicy(t, policyCtx, l)
+		cancelPolicy()
 		l.cfg.HAKeeperCheckInterval.Duration = time.Hour
 		l.cfg.HAKeeperTickInterval.Duration = time.Hour
 		release := make(chan struct{})

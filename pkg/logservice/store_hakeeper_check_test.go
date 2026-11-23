@@ -1099,14 +1099,15 @@ func TestCNAllocateIDRejectsUninitializedHAKeeper(t *testing.T) {
 func TestHAKeeperBootstrapErrorUsesConfiguredCadence(t *testing.T) {
 	runManualHAKeeperStoreTest(t, false, func(t *testing.T, s *store) {
 		require.NoError(t, s.setInitialClusterInfo(1, 1, 1, hakeeper.K8SIDRangeEnd+10, nil, nil))
+		ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout)
+		defer cancel()
+		commitTestHAKeeperPolicy(t, ctx, s)
 		// No LogStore heartbeat: bootstrap cannot place its replica yet. Exercise
 		// the real checker result consumed by the ticker, not a synthetic nil.
 		state := s.hakeeperCheck()
 		require.Nil(t, state)
 		require.Equal(t, s.cfg.HAKeeperCheckInterval.Duration, s.nextHAKeeperCheckInterval(state))
 
-		ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout)
-		defer cancel()
 		_, err := s.addLogStoreHeartbeat(ctx, s.getHeartbeatMessage())
 		require.NoError(t, err)
 		state = s.hakeeperCheck()

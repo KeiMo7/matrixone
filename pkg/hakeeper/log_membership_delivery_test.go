@@ -20,6 +20,7 @@ import (
 
 	sm "github.com/lni/dragonboat/v4/statemachine"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/hakeeper/logreplicas"
 	pb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
 	"github.com/matrixorigin/matrixone/pkg/pb/metadata"
 	"github.com/stretchr/testify/require"
@@ -579,6 +580,47 @@ func TestQueuedNonVotingAddRechecksLocality(t *testing.T) {
 			} else {
 				require.Equal(t, []pb.ScheduleCommand{add}, got.Commands)
 			}
+		})
+	}
+}
+
+func TestReleasedShardRegistrationAndPendingUpgrade(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("ack=%t", enabled), func(t *testing.T) {
+			s := NewStateMachine(0, 1).(*stateMachine)
+			s.state.CommandDeliveryEnabled = enabled
+			_, err := s.Update(sm.Entry{Index: s.state.Index + 1, Cmd: GetInitialClusterRequestCmd(1, 1, 3, 0, nil, nil)})
+			require.NoError(t, err)
+			shard := pb.LogShardInfo{ShardID: 77, Epoch: 7, Replicas: map[uint64]string{1: "a"}}
+			a := pb.LogStoreHeartbeat{UUID: "a", Replicas: []pb.LogReplicaInfo{{LogShardInfo: shard, ReplicaID: 1}}, CommandDeliverySupported: true}
+			unhappyHeartbeat(t, s, a)
+			// A released entry for an already observed shard did not create a
+			// desired record. Replaying it must retain that historical behavior.
+			_, err = s.Update(sm.Entry{Index: s.state.Index + 1, Cmd: GetAddLogShardCmd(pb.AddLogShard{ShardID: 77})})
+			require.NoError(t, err)
+			_, known := logreplicas.RecordForShard(77, s.state.ClusterInfo.LogShards)
+			require.False(t, known)
+			add := pb.ScheduleCommand{UUID: "a", ServiceType: pb.LogService, AddLogShard: &pb.AddLogShard{ShardID: 77}}
+			other := pb.ScheduleCommand{UUID: "a", ServiceType: pb.LogService, CreateTaskService: &pb.CreateTaskService{TaskDatabase: "task"}}
+			unhappyQueue(t, s, add, other)
+			queued := s.state.ScheduleCommands["a"]
+			got := membershipHeartbeat(t, s, a, true)
+			require.Equal(t, []pb.ScheduleCommand{other}, got.Commands)
+			require.Equal(t, []pb.ScheduleCommand{add}, s.state.ScheduleCommands["a"].Commands)
+			if enabled {
+				require.Equal(t, queued.CommandIDs[1:], got.CommandIDs)
+				require.Equal(t, queued.CommandIDs[:1], s.state.ScheduleCommands["a"].CommandIDs)
+			}
+			s = runtimeRestore(t, s)
+			installMembershipPolicy(t, s, testLogStoreTimeoutTicks)
+			require.Equal(t, []pb.ScheduleCommand{add}, membershipHeartbeat(t, s, a, true).Commands)
+			observed := s.state.LogState.Shards[77]
+			_, err = s.Update(sm.Entry{Index: s.state.Index + 1, Cmd: GetAddLogShardCmd(*add.AddLogShard)})
+			require.NoError(t, err)
+			record, known := logreplicas.RecordForShard(77, s.state.ClusterInfo.LogShards)
+			require.True(t, known)
+			require.Equal(t, uint64(3), record.NumberOfReplicas)
+			require.Equal(t, observed, s.state.LogState.Shards[77])
 		})
 	}
 }

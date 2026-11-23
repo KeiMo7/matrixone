@@ -443,6 +443,8 @@ func TestServiceBootstrapShard(t *testing.T) {
 	}()
 
 	cmd := pb.ScheduleCommand{
+		UUID:        service.ID(),
+		ServiceType: pb.LogService,
 		BootstrapShard: &pb.BootstrapShard{
 			ShardID:   1,
 			ReplicaID: 100,
@@ -598,6 +600,42 @@ func TestStartConflictingWithBatchStopNeedsRedelivery(t *testing.T) {
 		require.True(t, s.store.nh.HasNodeInfo(2, 5), "an independent start must still run")
 		s.handleCommands(context.Background(), nil)
 		require.False(t, s.store.nh.HasNodeInfo(1, 2), "a later empty heartbeat must not replay the skipped start")
+	})
+}
+
+func TestBootstrapShardHonorsLocalGuards(t *testing.T) {
+	t.Run("wrong recipient", func(t *testing.T) {
+		runServiceTest(t, false, false, func(t *testing.T, s *Service) {
+			cmd := pb.ScheduleCommand{UUID: "other", ServiceType: pb.LogService,
+				BootstrapShard: &pb.BootstrapShard{
+					ShardID: 2, ReplicaID: 2, InitialMembers: map[uint64]string{2: s.ID()},
+				}}
+			s.handleCommands(context.Background(), []pb.ScheduleCommand{cmd})
+			require.False(t, s.store.nh.HasNodeInfo(2, 2))
+		})
+	})
+	t.Run("wrong initial member", func(t *testing.T) {
+		runServiceTest(t, false, false, func(t *testing.T, s *Service) {
+			cmd := pb.ScheduleCommand{UUID: s.ID(), ServiceType: pb.LogService,
+				BootstrapShard: &pb.BootstrapShard{
+					ShardID: 2, ReplicaID: 2, InitialMembers: map[uint64]string{2: "other"},
+				}}
+			s.handleCommands(context.Background(), []pb.ScheduleCommand{cmd})
+			require.False(t, s.store.nh.HasNodeInfo(2, 2))
+		})
+	})
+	t.Run("same batch stop", func(t *testing.T) {
+		runServiceTest(t, false, false, func(t *testing.T, s *Service) {
+			bootstrap := pb.ScheduleCommand{UUID: s.ID(), ServiceType: pb.LogService,
+				BootstrapShard: &pb.BootstrapShard{
+					ShardID: 2, ReplicaID: 2, InitialMembers: map[uint64]string{2: s.ID()},
+				}}
+			stop := pb.ScheduleCommand{UUID: s.ID(), ServiceType: pb.LogService,
+				ConfigChange: &pb.ConfigChange{ChangeType: pb.StopReplica,
+					Replica: pb.Replica{UUID: s.ID(), ShardID: 2, ReplicaID: 2}}}
+			s.handleCommands(context.Background(), []pb.ScheduleCommand{bootstrap, stop})
+			require.False(t, s.store.nh.HasNodeInfo(2, 2))
+		})
 	})
 }
 

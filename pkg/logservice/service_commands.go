@@ -103,7 +103,19 @@ func (s *Service) handleCommands(ctx context.Context, cmds []pb.ScheduleCommand)
 			s.createSQLLogger(cmd.CreateTaskService)
 		} else if cmd.GetAddLogShard() != nil {
 			s.handleAddLogShard(cmd)
-		} else if cmd.GetBootstrapShard() != nil {
+		} else if bootstrap := cmd.GetBootstrapShard(); bootstrap != nil {
+			replica := pb.Replica{
+				UUID: cmd.UUID, ShardID: bootstrap.ShardID, ReplicaID: bootstrap.ReplicaID,
+			}
+			if cmd.ServiceType != pb.LogService || cmd.UUID != s.ID() ||
+				bootstrap.InitialMembers[bootstrap.ReplicaID] != s.ID() ||
+				stopping[bootstrap.ShardID] || !s.canStartLocalReplica(replica) {
+				s.runtime.Logger().Warn("skipping invalid or conflicting shard bootstrap", zap.String("command", cmd.LogString()))
+				continue
+			}
+			if ctx.Err() != nil {
+				continue
+			}
 			s.handleBootstrapShard(cmd)
 		} else {
 			panic(fmt.Sprintf("unknown schedule command type: %+v", cmd))

@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	"github.com/matrixorigin/matrixone/pkg/hakeeper"
+	"github.com/matrixorigin/matrixone/pkg/hakeeper/checkers/util"
 	"github.com/matrixorigin/matrixone/pkg/hakeeper/operator"
 	pb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
 	"github.com/matrixorigin/matrixone/pkg/pb/metadata"
@@ -72,7 +73,7 @@ func TestPendingRemovalWaitsForInFlightStart(t *testing.T) {
 				}
 			}
 			for _, ops := range [][]*operator.Operator{{start, remove}, {remove, start}} {
-				got := PendingOperators(fields, state, voting, observers, 0, ops, nil)
+				got := PendingOperators(fields, state, voting, observers, 0, pb.Locality{}, ops, nil)
 				require.Empty(t, got, "neither previously delivered command is safe to resend")
 			}
 			oldReplica := replica
@@ -83,9 +84,9 @@ func TestPendingRemovalWaitsForInFlightStart(t *testing.T) {
 			} else {
 				oldRemove = operator.NewOperator("", 1, 7, operator.RemoveLogService{Target: "a", Replica: oldReplica})
 			}
-			require.Empty(t, PendingOperators(fields, state, voting, observers, 0, []*operator.Operator{start, oldRemove}, nil),
+			require.Empty(t, PendingOperators(fields, state, voting, observers, 0, pb.Locality{}, []*operator.Operator{start, oldRemove}, nil),
 				"conflicts use shard and replica ID even if an old command has another UUID")
-			got := PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, []*operator.Operator{remove}, nil)
+			got := PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, pb.Locality{}, []*operator.Operator{remove}, nil)
 			require.Equal(t, []*operator.Operator{remove}, got, "removal resumes when no Start is tracked")
 			if !nonVoting {
 				shard.Replicas[4] = "d"
@@ -94,7 +95,7 @@ func TestPendingRemovalWaitsForInFlightStart(t *testing.T) {
 				other := operator.NewOperator("", 1, 7, operator.RemoveLogService{
 					Target: "a", Replica: operator.Replica{UUID: "d", ShardID: 1, ReplicaID: 4, Epoch: 7},
 				})
-				got = PendingOperators(fields, state, voting, observers, 0, []*operator.Operator{start, other}, nil)
+				got = PendingOperators(fields, state, voting, observers, 0, pb.Locality{}, []*operator.Operator{start, other}, nil)
 				require.ElementsMatch(t, []*operator.Operator{start, other}, got,
 					"a Start must not block a different safe removal")
 			}
@@ -147,7 +148,7 @@ func TestPendingOperatorsFollowCurrentLogCandidates(t *testing.T) {
 			}
 			fields := hakeeper.NewCheckerCommonFields("", cfg, nil, pb.ClusterInfo{LogShards: []metadata.LogShardRecord{{ShardID: 1, NumberOfReplicas: uint64(tt.normal)}}}, pb.TaskTableUser{}, tick)
 			op := operator.NewOperator("", 1, 1, tt.step)
-			got := PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, uint64(tt.nonVoting), []*operator.Operator{nil, op, op}, nil)
+			got := PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, uint64(tt.nonVoting), pb.Locality{}, []*operator.Operator{nil, op, op}, nil)
 			if tt.want {
 				require.Equal(t, []*operator.Operator{op}, got)
 			} else {
@@ -155,7 +156,7 @@ func TestPendingOperatorsFollowCurrentLogCandidates(t *testing.T) {
 			}
 			for _, terminal := range []operator.OpStatus{operator.SUCCESS, operator.CANCELED, operator.EXPIRED} {
 				op.SetStatus(terminal)
-				require.Empty(t, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, uint64(tt.nonVoting), []*operator.Operator{op}, nil))
+				require.Empty(t, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, uint64(tt.nonVoting), pb.Locality{}, []*operator.Operator{op}, nil))
 			}
 		})
 	}
@@ -181,7 +182,7 @@ func TestPendingAddSlotsAndStepProgress(t *testing.T) {
 	start := operator.StartLogService{Replica: operator.Replica{UUID: "b", ShardID: 1, ReplicaID: 3}}
 	op := operator.NewOperator("", 1, 1, add, start)
 	extra := operator.NewOperator("", 1, 1, operator.AddLogService{Target: "a", Replica: operator.Replica{UUID: "c", ShardID: 1, ReplicaID: 4, Epoch: 1}})
-	require.Equal(t, []*operator.Operator{op}, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, []*operator.Operator{op, extra}, nil))
+	require.Equal(t, []*operator.Operator{op}, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, pb.Locality{}, []*operator.Operator{op, extra}, nil))
 	controller := operator.NewController()
 	cmds := controller.Dispatch([]*operator.Operator{op}, state, pb.TNState{}, pb.CNState{}, pb.ProxyState{})
 	require.Equal(t, pb.AddReplica, cmds[0].ConfigChange.ChangeType)
@@ -189,13 +190,13 @@ func TestPendingAddSlotsAndStepProgress(t *testing.T) {
 	shard.Replicas[3] = "b"
 	shard.Epoch = 2
 	state.Shards[1] = shard
-	require.Equal(t, []*operator.Operator{op}, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, []*operator.Operator{op, extra}, nil))
+	require.Equal(t, []*operator.Operator{op}, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, pb.Locality{}, []*operator.Operator{op, extra}, nil))
 	cmds = controller.Dispatch([]*operator.Operator{op}, state, pb.TNState{}, pb.CNState{}, pb.ProxyState{})
 	require.Equal(t, pb.StartReplica, cmds[0].ConfigChange.ChangeType)
 	store := state.Stores["b"]
 	store.Replicas = []pb.LogReplicaInfo{{LogShardInfo: shard, ReplicaID: 3}}
 	state.Stores["b"] = store
-	require.Empty(t, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, []*operator.Operator{op}, nil))
+	require.Empty(t, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, pb.Locality{}, []*operator.Operator{op}, nil))
 	require.Equal(t, operator.SUCCESS, op.Status())
 }
 
@@ -215,11 +216,11 @@ func TestPendingStartsRespectStoreIncarnation(t *testing.T) {
 		}
 		op := operator.NewOperator("", 1, 1, step)
 		state := pb.LogState{Shards: map[uint64]pb.LogShardInfo{1: shard}, Stores: map[string]pb.LogStoreInfo{"a": {Tick: 1, StoreIncarnation: "old"}}}
-		require.Equal(t, []*operator.Operator{op}, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, n, []*operator.Operator{op}, nil))
+		require.Equal(t, []*operator.Operator{op}, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, n, pb.Locality{}, []*operator.Operator{op}, nil))
 		store := state.Stores["a"]
 		store.StoreIncarnation = "new"
 		state.Stores["a"] = store
-		require.Empty(t, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, n, []*operator.Operator{op}, nil))
+		require.Empty(t, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, n, pb.Locality{}, []*operator.Operator{op}, nil))
 		require.Equal(t, operator.STARTED, op.Status(), "an obsolete projection is not a fabricated completion")
 	}
 }
@@ -250,23 +251,56 @@ func TestPendingMembershipSingleChangePerShard(t *testing.T) {
 	store := state.Stores["a"]
 	store.Replicas = nil
 	state.Stores["a"] = store
-	require.Empty(t, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, []*operator.Operator{addOnA}, nil))
+	require.Empty(t, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, pb.Locality{}, []*operator.Operator{addOnA}, nil))
 
 	// Replacing it with a current reporter restores retry, and a sibling change
 	// for the same shard and epoch is withheld until the first is observed.
 	otherAdd := operator.NewOperator("", 1, 1, operator.AddLogService{
 		Target: "b", Replica: operator.Replica{UUID: "g", ShardID: 1, ReplicaID: 7, Epoch: 1},
 	})
-	require.Equal(t, []*operator.Operator{addOnB}, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, []*operator.Operator{addOnB}, nil))
-	require.Equal(t, []*operator.Operator{otherAdd}, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, []*operator.Operator{otherAdd}, nil))
-	require.Equal(t, []*operator.Operator{addOnB}, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, []*operator.Operator{addOnB, otherAdd}, nil))
-	require.Equal(t, []*operator.Operator{addOnB}, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, []*operator.Operator{addOnA, addOnB}, nil),
+	require.Equal(t, []*operator.Operator{addOnB}, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, pb.Locality{}, []*operator.Operator{addOnB}, nil))
+	require.Equal(t, []*operator.Operator{otherAdd}, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, pb.Locality{}, []*operator.Operator{otherAdd}, nil))
+	require.Equal(t, []*operator.Operator{addOnB}, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, pb.Locality{}, []*operator.Operator{addOnB, otherAdd}, nil))
+	require.Equal(t, []*operator.Operator{addOnB}, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, pb.Locality{}, []*operator.Operator{addOnA, addOnB}, nil),
 		"an ineligible older owner must not consume the retry slot")
-	require.Empty(t, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, []*operator.Operator{addOnB}, []*operator.Operator{otherAdd}),
+	require.Empty(t, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, pb.Locality{}, []*operator.Operator{addOnB}, []*operator.Operator{otherAdd}),
 		"fresh and retried changes share the same slot")
 	learner := operator.NewOperator("", 1, 1, operator.AddNonVotingLogService{
 		Target: "b", Replica: operator.Replica{UUID: "g", ShardID: 1, ReplicaID: 7, Epoch: 1},
 	})
-	require.Equal(t, []*operator.Operator{addOnB}, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 2, []*operator.Operator{addOnB, learner}, nil),
+	require.Equal(t, []*operator.Operator{addOnB}, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 2, pb.Locality{}, []*operator.Operator{addOnB, learner}, nil),
 		"voters and non-voters share the same Raft configuration")
+}
+
+func TestPendingNonVotingAddRechecksLocality(t *testing.T) {
+	cfg := hakeeper.Config{}
+	cfg.Fill()
+	fields := hakeeper.NewCheckerCommonFields("", cfg, nil,
+		pb.ClusterInfo{LogShards: []metadata.LogShardRecord{{ShardID: 1, NumberOfReplicas: 3}}},
+		pb.TaskTableUser{}, 1)
+	shard := pb.LogShardInfo{ShardID: 1, Epoch: 7, Replicas: map[uint64]string{1: "a", 2: "b", 3: "c"}}
+	state := pb.LogState{Shards: map[uint64]pb.LogShardInfo{1: shard}, Stores: map[string]pb.LogStoreInfo{
+		"d": {Tick: 1, Locality: pb.Locality{Value: map[string]string{"zone": "east"}}},
+		"e": {Tick: 1, Locality: pb.Locality{Value: map[string]string{"zone": "west"}}},
+	}}
+	for id, uuid := range shard.Replicas {
+		state.Stores[uuid] = pb.LogStoreInfo{Tick: 1, Replicas: []pb.LogReplicaInfo{{LogShardInfo: shard, ReplicaID: id}}}
+	}
+	old := operator.NewOperator("", 1, 7, operator.AddNonVotingLogService{Target: "a", Replica: operator.Replica{UUID: "d", ShardID: 1, ReplicaID: 4, Epoch: 7}})
+	pending := func(locality pb.Locality) []*operator.Operator {
+		return PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 1, locality, []*operator.Operator{old}, nil)
+	}
+	require.Equal(t, []*operator.Operator{old}, pending(pb.Locality{Value: map[string]string{"zone": "east"}}))
+	require.Empty(t, pending(pb.Locality{Value: map[string]string{"zone": "west"}}))
+	require.False(t, old.IsEnd(), "a possibly delivered operation retains its owner")
+	old.Cancel()
+	fields.Alloc = util.NewTestIDAllocator(100)
+	checker := NewLogServiceChecker(fields, state, pb.TNState{}, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 1, pb.Locality{Value: map[string]string{"zone": "west"}}, false)
+	var target string
+	for _, op := range checker.Check() {
+		if step, ok := op.OpSteps()[0].(operator.AddNonVotingLogService); ok {
+			target = step.UUID
+		}
+	}
+	require.Equal(t, "e", target, "the next plan chooses the currently eligible store")
 }

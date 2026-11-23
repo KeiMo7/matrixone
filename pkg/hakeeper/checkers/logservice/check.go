@@ -466,8 +466,8 @@ func (t *checkAddShard) check() []*operator.Operator {
 	// So, check if there are three shards already.
 	requiredShardNum := 3
 
-	// the shard num is equal to the required, return directly.
-	if len(t.lc.logState.Shards) == requiredShardNum {
+	// Only registered shards satisfy the configured standby requirement.
+	if len(t.lc.Cluster.LogShards) >= requiredShardNum {
 		return nil
 	}
 
@@ -493,11 +493,18 @@ func (t *checkAddShard) check() []*operator.Operator {
 		if ok1 && !ok2 {
 			return -1
 		}
-		return cmp.Compare(t.lc.logState.Stores[b].Tick,
-			t.lc.logState.Stores[a].Tick)
+		if byTick := cmp.Compare(t.lc.logState.Stores[b].Tick, t.lc.logState.Stores[a].Tick); byTick != 0 {
+			return byTick
+		}
+		return cmp.Compare(a, b)
 	})
 
 	var maxShardID uint64
+	for _, record := range t.lc.Cluster.LogShards {
+		if record.ShardID > maxShardID {
+			maxShardID = record.ShardID
+		}
+	}
 	for shardID := range t.lc.logState.Shards {
 		if shardID > maxShardID {
 			maxShardID = shardID

@@ -21,6 +21,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"sort"
 	"strings"
@@ -516,6 +517,247 @@ func bootstrapAllocationRequestKey(key, requestID string) string {
 	return bootstrapAllocationRequestPrefix + key + "\x00" + requestID
 }
 
+type bootstrapShardIntent struct {
+	shardID   uint64
+	replicaID uint64
+	members   map[uint64]string
+}
+
+func bootstrapShardIntentFromCommand(command pb.ScheduleCommand) (bootstrapShardIntent, bool) {
+	if command.ServiceType != pb.LogService || command.Bootstrapping || command.BootstrapShard == nil {
+		return bootstrapShardIntent{}, false
+	}
+	bootstrap := command.BootstrapShard
+	if bootstrap.Join || len(bootstrap.InitialMembers) == 0 ||
+		bootstrap.InitialMembers[bootstrap.ReplicaID] != command.UUID || command.UUID == "" {
+		return bootstrapShardIntent{}, false
+	}
+	seen := make(map[string]struct{}, len(bootstrap.InitialMembers))
+	for _, storeID := range bootstrap.InitialMembers {
+		if storeID == "" {
+			return bootstrapShardIntent{}, false
+		}
+		if _, ok := seen[storeID]; ok {
+			return bootstrapShardIntent{}, false
+		}
+		seen[storeID] = struct{}{}
+	}
+	return bootstrapShardIntent{
+		shardID:   bootstrap.ShardID,
+		replicaID: bootstrap.ReplicaID,
+		members:   bootstrap.InitialMembers,
+	}, true
+}
+
+// bootstrapShardCompatible checks that a queued initial configuration still
+// matches current HAKeeper authority. An empty shard record is expected before
+// its first replica reports; a positive epoch without members is ambiguous and
+// must wait for an authoritative report.
+func (s *stateMachine) bootstrapShardCompatible(intent bootstrapShardIntent) (valid, observed, wait bool) {
+	record, known := logreplicas.RecordForShard(intent.shardID, s.state.ClusterInfo.LogShards)
+	if !known || record.NumberOfReplicas != uint64(len(intent.members)) {
+		return false, false, false
+	}
+	shard, exists := s.state.LogState.Shards[intent.shardID]
+	if !exists {
+		return true, false, false
+	}
+	for replicaID, storeID := range intent.members {
+		if logreplicas.StoreIncarnationChanged(
+			replicaID,
+			storeID,
+			shard.ReplicaStoreIncarnations,
+			s.state.LogState.Stores,
+		) {
+			return false, false, false
+		}
+	}
+	if len(shard.NonVotingReplicas) != 0 {
+		return false, false, false
+	}
+	if len(shard.Replicas) == 0 {
+		return true, false, shard.Epoch != 0
+	}
+	if !maps.Equal(shard.Replicas, intent.members) {
+		return false, false, false
+	}
+	return true, true, false
+}
+
+func (s *stateMachine) bootstrapShardCommandStatus(command pb.ScheduleCommand) (keep, deliver bool) {
+	intent, ok := bootstrapShardIntentFromCommand(command)
+	if !ok {
+		return false, false
+	}
+	valid, observed, wait := s.bootstrapShardCompatible(intent)
+	if !valid {
+		return false, false
+	}
+	if wait {
+		return true, false
+	}
+	if !observed {
+		for _, batch := range s.state.ScheduleCommands {
+			for _, queued := range batch.Commands {
+				other, ok := bootstrapShardIntentFromCommand(queued)
+				if !ok || other.shardID != intent.shardID || maps.Equal(other.members, intent.members) {
+					continue
+				}
+				otherValid, otherObserved, _ := s.bootstrapShardCompatible(other)
+				if otherValid && !otherObserved {
+					return true, false
+				}
+			}
+		}
+	}
+	return true, true
+}
+
+func (s *stateMachine) pendingBootstrapCommands() map[string]pb.CommandBatch {
+	pending := make(map[string]pb.CommandBatch)
+	for uuid, batch := range s.state.ScheduleCommands {
+		var commands []pb.ScheduleCommand
+		var ids []pb.ScheduleCommandID
+		hasIDs := len(batch.CommandIDs) == len(batch.Commands)
+		for i, command := range batch.Commands {
+			if _, bootstrap := bootstrapShardIntentFromCommand(command); !bootstrap {
+				continue
+			}
+			keep, _ := s.bootstrapShardCommandStatus(command)
+			if !keep {
+				continue
+			}
+			commands = append(commands, command)
+			if hasIDs {
+				ids = append(ids, batch.CommandIDs[i])
+			}
+		}
+		if len(commands) == 0 {
+			continue
+		}
+		batch.Commands = commands
+		if hasIDs {
+			batch.CommandIDs = ids
+		} else {
+			batch.CommandIDs = nil
+		}
+		pending[uuid] = batch
+	}
+	return pending
+}
+
+func (s *stateMachine) pendingBootstrapClaims() map[uint64][]bootstrapShardIntent {
+	claims := make(map[uint64][]bootstrapShardIntent)
+	for _, batch := range s.state.ScheduleCommands {
+		for _, command := range batch.Commands {
+			intent, ok := bootstrapShardIntentFromCommand(command)
+			if !ok {
+				continue
+			}
+			valid, _, _ := s.bootstrapShardCompatible(intent)
+			if valid {
+				claims[intent.shardID] = append(claims[intent.shardID], intent)
+			}
+		}
+	}
+	return claims
+}
+
+func isLogReplicaStart(command pb.ScheduleCommand) bool {
+	if command.ServiceType != pb.LogService || command.Bootstrapping || command.ConfigChange == nil {
+		return false
+	}
+	switch command.ConfigChange.ChangeType {
+	case pb.StartReplica, pb.StartNonVotingReplica:
+		return true
+	default:
+		return false
+	}
+}
+
+func bootstrapStartConflictsWithClaims(command pb.ScheduleCommand, claims map[uint64][]bootstrapShardIntent) bool {
+	if !isLogReplicaStart(command) {
+		return false
+	}
+	change := command.ConfigChange
+	for _, intent := range claims[change.Replica.ShardID] {
+		if intent.replicaID == change.Replica.ReplicaID &&
+			intent.members[intent.replicaID] == command.UUID &&
+			change.Replica.UUID == command.UUID {
+			return true
+		}
+	}
+	return false
+}
+
+func bootstrapCommandConflictsWithClaims(command pb.ScheduleCommand, claims map[uint64][]bootstrapShardIntent) bool {
+	if command.ServiceType != pb.LogService || command.Bootstrapping {
+		return false
+	}
+	if command.BootstrapShard != nil {
+		return len(claims[command.BootstrapShard.ShardID]) != 0
+	}
+	return bootstrapStartConflictsWithClaims(command, claims)
+}
+
+func (s *stateMachine) removePendingBootstraps(stores map[string]bool) {
+	for uuid, batch := range s.state.ScheduleCommands {
+		var commands []pb.ScheduleCommand
+		var ids []pb.ScheduleCommandID
+		hasIDs := len(batch.CommandIDs) == len(batch.Commands)
+		for i, command := range batch.Commands {
+			_, bootstrap := bootstrapShardIntentFromCommand(command)
+			if bootstrap && stores[uuid] {
+				continue
+			}
+			commands = append(commands, command)
+			if hasIDs {
+				ids = append(ids, batch.CommandIDs[i])
+			}
+		}
+		if len(commands) == 0 {
+			delete(s.state.ScheduleCommands, uuid)
+			continue
+		}
+		batch.Commands = commands
+		if hasIDs {
+			batch.CommandIDs = ids
+		} else {
+			batch.CommandIDs = nil
+		}
+		s.state.ScheduleCommands[uuid] = batch
+	}
+}
+
+func bootstrapShardCommandBlockedByBatch(command pb.ScheduleCommand, batch []pb.ScheduleCommand) bool {
+	intent, ok := bootstrapShardIntentFromCommand(command)
+	if !ok {
+		return false
+	}
+	hold := false
+	for _, other := range batch {
+		if other.ServiceType != pb.LogService {
+			continue
+		}
+		change := other.ConfigChange
+		if change == nil || change.Replica.ShardID != intent.shardID {
+			continue
+		}
+		switch change.ChangeType {
+		case pb.AddReplica, pb.RemoveReplica, pb.AddNonVotingReplica, pb.RemoveNonVotingReplica:
+			// A proposal has not changed the authoritative member map. Keep the
+			// bootstrap queued until reports confirm whether it is still valid.
+			hold = true
+		case pb.StopReplica, pb.StopNonVotingReplica, pb.KillZombie:
+			if other.UUID == command.UUID &&
+				(change.Replica.UUID == "" || change.Replica.UUID == command.UUID) {
+				hold = true
+			}
+		}
+	}
+	return hold
+}
+
 func (s *stateMachine) handleUpdateCommandsCmd(cmd []byte) sm.Result {
 	data := cmd[headerSize:]
 	var b pb.CommandBatch
@@ -540,17 +782,36 @@ func (s *stateMachine) handleUpdateCommandsCmd(cmd []byte) sm.Result {
 		}
 	}
 
+	policyReady := s.state.LogStoreTimeoutPolicyTerm != 0
 	s.state.Term = b.Term
 	if s.state.CommandDeliveryEnabled || s.state.CommandDeliveryPreparing {
 		if s.state.ScheduleCommands == nil {
 			s.state.ScheduleCommands = make(map[string]pb.CommandBatch)
 		}
+	} else if policyReady {
+		// LogStore bootstrap commands are already-approved initial configurations.
+		// Keep undelivered commands across legacy replacement; other work retains
+		// the historical replace-on-update behavior.
+		s.state.ScheduleCommands = s.pendingBootstrapCommands()
 	} else {
-		// Legacy batches replace the previous schedule. The checker rebuilds
-		// needed work from the current replicated state.
+		// Before a committed timeout policy, replay released schedule replacement
+		// semantics exactly. The live checker does not publish new schedules yet.
 		s.state.ScheduleCommands = make(map[string]pb.CommandBatch)
 	}
+	var bootstrapClaims map[uint64][]bootstrapShardIntent
+	if policyReady {
+		for _, c := range b.Commands {
+			if c.ServiceType == pb.LogService && !c.Bootstrapping &&
+				(c.BootstrapShard != nil || isLogReplicaStart(c)) {
+				bootstrapClaims = s.pendingBootstrapClaims()
+				break
+			}
+		}
+	}
 	for _, c := range b.Commands {
+		if policyReady && len(bootstrapClaims) != 0 && bootstrapCommandConflictsWithClaims(c, bootstrapClaims) {
+			continue
+		}
 		// Reject terminally obsolete work at its only admission boundary.
 		// Cleanup and recovery remain defense in depth for commands accepted
 		// by an older binary or made stale while already queued.
@@ -807,7 +1068,19 @@ func (s *stateMachine) getCommandBatchFiltered(
 			deliverIDs = make([]pb.ScheduleCommandID, 0, len(batch.CommandIDs))
 			pendingIDs = make([]pb.ScheduleCommandID, 0, len(batch.CommandIDs))
 		}
+		var bootstrapClaims map[uint64][]bootstrapShardIntent
+		if guarded && s.state.LogStoreTimeoutPolicyTerm != 0 {
+			for _, cmd := range batch.Commands {
+				if isLogReplicaStart(cmd) {
+					bootstrapClaims = s.pendingBootstrapClaims()
+					break
+				}
+			}
+		}
 		for i, cmd := range batch.Commands {
+			if len(bootstrapClaims) != 0 && bootstrapStartConflictsWithClaims(cmd, bootstrapClaims) {
+				continue
+			}
 			if s.catalogScheduleObsolete(cmd) {
 				continue
 			}
@@ -815,11 +1088,26 @@ func (s *stateMachine) getCommandBatchFiltered(
 			if applied {
 				continue
 			}
+			if guarded && s.state.LogStoreTimeoutPolicyTerm != 0 && cmd.BootstrapShard != nil {
+				hold := bootstrapShardCommandBlockedByBatch(cmd, batch.Commands)
+				keep, deliver := s.bootstrapShardCommandStatus(cmd)
+				if !keep {
+					continue
+				}
+				if hold || !deliver {
+					pending = append(pending, cmd)
+					if pendingIDs != nil {
+						pendingIDs = append(pendingIDs, batch.CommandIDs[i])
+					}
+					continue
+				}
+			}
 			mustWait := hb != nil && !s.logScheduleCommandDeliverable(cmd)
-			if !mustWait && guarded && isLogMembershipChange(cmd) {
-				if s.state.LogStoreTimeoutPolicyTerm == 0 {
+			if !mustWait && guarded {
+				if s.state.LogStoreTimeoutPolicyTerm == 0 &&
+					(isLogMembershipChange(cmd) || (cmd.ServiceType == pb.LogService && cmd.AddLogShard != nil)) {
 					mustWait = true
-				} else if !s.logMembershipDeliverable(uuid, cmd) {
+				} else if isLogMembershipChange(cmd) && !s.logMembershipDeliverable(uuid, cmd) {
 					continue
 				}
 			}
@@ -895,7 +1183,10 @@ func (s *stateMachine) logMembershipDeliverable(uuid string, cmd pb.ScheduleComm
 	// checker's current per-shard plan at the point of delivery, particularly
 	// when a store or the requested non-voting replica count has recovered.
 	shard := s.state.LogState.Shards[change.Replica.ShardID]
-	record := logreplicas.RecordForShard(shard.ShardID, s.state.ClusterInfo.LogShards)
+	record, known := logreplicas.RecordForShard(shard.ShardID, s.state.ClusterInfo.LogShards)
+	if !known || record.NumberOfReplicas == 0 {
+		return false
+	}
 	var expired []string
 	for _, members := range []map[uint64]string{shard.Replicas, shard.NonVotingReplicas} {
 		for _, member := range members {
@@ -916,7 +1207,7 @@ func (s *stateMachine) logMembershipDeliverable(uuid string, cmd pb.ScheduleComm
 		return !retained
 	case pb.AddReplica, pb.AddNonVotingReplica:
 		// The checker bootstraps an empty voting group instead of adding to it.
-		if record.NumberOfReplicas == 0 || uint64(normal.ToAdd) == record.NumberOfReplicas {
+		if uint64(normal.ToAdd) == record.NumberOfReplicas {
 			return false
 		}
 		wanted, locality := normal.ToAdd, pb.Locality{}
@@ -1179,6 +1470,11 @@ func (s *stateMachine) handleLogHeartbeat(data []byte, guarded bool) (result sm.
 	previous, registered := s.state.LogState.Stores[hb.UUID]
 	deliveryReady := s.state.CommandDeliveryReady[hb.UUID]
 	admissionReady := s.state.ViewMetadataAdmissionLogReady[hb.UUID]
+	if guarded && s.state.LogStoreTimeoutPolicyTerm != 0 &&
+		registered && previous.StoreIncarnation != "" && hb.StoreIncarnation != "" &&
+		previous.StoreIncarnation != hb.StoreIncarnation {
+		s.removePendingBootstraps(map[string]bool{hb.UUID: true})
+	}
 	s.state.LogState.Update(hb, s.state.Tick)
 	defer func() {
 		if !registered ||
@@ -1568,29 +1864,21 @@ func (s *stateMachine) handleUpdateNonVotingLocality(cmd []byte) sm.Result {
 
 func (s *stateMachine) handleLogShardUpdate(cmd []byte) sm.Result {
 	addLogShard := parseLogShardUpdateCmd(cmd)
-	_, ok := s.state.LogState.Shards[addLogShard.ShardID]
-	if !ok {
-		s.state.LogState.Shards[addLogShard.ShardID] = pb.LogShardInfo{
-			ShardID: addLogShard.ShardID,
-		}
-		var exists bool
+	_, observed := s.state.LogState.Shards[addLogShard.ShardID]
+	if !observed {
+		s.state.LogState.Shards[addLogShard.ShardID] = pb.LogShardInfo{ShardID: addLogShard.ShardID}
+	} else if s.state.LogStoreTimeoutPolicyTerm == 0 {
+		// Released entries treated an already-observed shard as a no-op. A
+		// committed policy marks the start of upgraded scheduling semantics.
+		return sm.Result{}
+	}
+	if _, registered := logreplicas.RecordForShard(addLogShard.ShardID, s.state.ClusterInfo.LogShards); !registered {
 		var numOfLogReplicas uint64
-		for _, logShardRec := range s.state.ClusterInfo.LogShards {
-			numOfLogReplicas = logShardRec.NumberOfReplicas
-			if logShardRec.ShardID == addLogShard.ShardID {
-				exists = true
-				break
-			}
+		for _, record := range s.state.ClusterInfo.LogShards {
+			numOfLogReplicas = record.NumberOfReplicas
 		}
-		if !exists {
-			s.state.ClusterInfo.LogShards = append(
-				s.state.ClusterInfo.LogShards,
-				metadata.LogShardRecord{
-					ShardID:          addLogShard.ShardID,
-					NumberOfReplicas: numOfLogReplicas,
-				},
-			)
-		}
+		s.state.ClusterInfo.LogShards = append(s.state.ClusterInfo.LogShards,
+			metadata.LogShardRecord{ShardID: addLogShard.ShardID, NumberOfReplicas: numOfLogReplicas})
 	}
 	return sm.Result{}
 }

@@ -135,8 +135,8 @@ func TestCheckerPrefersSafeSurplusAndStartsWhenQuorumIsMissing(t *testing.T) {
 	require.False(t, startedD, "wait for the in-flight removal before restarting the same identity")
 	pending := operator.NewOperator("", 1, 1, operator.StartLogService{Replica: operator.Replica{UUID: "d", ShardID: 1, ReplicaID: 4}})
 	removing := operator.NewOperator("", 1, 1, operator.RemoveLogService{Target: "a", Replica: operator.Replica{UUID: "d", ShardID: 1, ReplicaID: 4, Epoch: 1}})
-	require.NotContains(t, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, []*operator.Operator{pending, removing}, nil), pending)
-	require.NotContains(t, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, []*operator.Operator{pending}, []*operator.Operator{removing}), pending)
+	require.NotContains(t, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, pb.Locality{}, []*operator.Operator{pending, removing}, nil), pending)
+	require.NotContains(t, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, pb.Locality{}, []*operator.Operator{pending}, []*operator.Operator{removing}), pending)
 	c.Replicas = []pb.LogReplicaInfo{{LogShardInfo: shard, ReplicaID: 3}}
 	state.Stores["c"] = c
 	delete(shard.Replicas, 4)
@@ -1586,4 +1586,28 @@ func TestStartDoesNotRacePreviouslyDispatchedRemoval(t *testing.T) {
 	require.Empty(t, removals, "another removal must wait for the current configuration change")
 	require.NotEmpty(t, hakeeper.LogMembershipTargets(cfg, state, 1, pb.RemoveReplica,
 		pb.Replica{ShardID: 1, ReplicaID: 4, UUID: "d", Epoch: 7}))
+}
+
+func TestStandbyShardUsesRegisteredConfiguration(t *testing.T) {
+	cfg := hakeeper.Config{}
+	cfg.Fill()
+	cluster := pb.ClusterInfo{LogShards: []metadata.LogShardRecord{{ShardID: 0, NumberOfReplicas: 1}, {ShardID: 1, NumberOfReplicas: 1}}}
+	state := pb.LogState{
+		Shards: map[uint64]pb.LogShardInfo{0: {ShardID: 0}, 1: {ShardID: 1}, 77: {ShardID: 77}},
+		Stores: map[string]pb.LogStoreInfo{"a": {Tick: 1}},
+	}
+	check := func(cluster pb.ClusterInfo) []uint64 {
+		fields := hakeeper.NewCheckerCommonFields("", cfg, util.NewTestIDAllocator(100), cluster, pb.TaskTableUser{}, 1)
+		checker := NewLogServiceChecker(fields, state, pb.TNState{}, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, pb.Locality{}, true)
+		var shards []uint64
+		for _, op := range checker.Check() {
+			if step, ok := op.OpSteps()[0].(operator.AddLogShard); ok {
+				shards = append(shards, step.ShardID)
+			}
+		}
+		return shards
+	}
+	require.Equal(t, []uint64{78}, check(cluster), "an observed orphan is not a registered standby shard")
+	cluster.LogShards = append(cluster.LogShards, metadata.LogShardRecord{ShardID: 4, NumberOfReplicas: 1})
+	require.Empty(t, check(cluster), "a configured standby need not have reported yet")
 }

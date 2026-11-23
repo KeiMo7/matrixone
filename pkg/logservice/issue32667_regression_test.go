@@ -60,6 +60,7 @@ func TestBootstrapLeaderRetakeStartsNewTermBudget(t *testing.T) {
 				}
 				require.NotEqual(t, -1, first)
 				a := stores[first]
+				commitTestHAKeeperPolicy(t, ctx, a)
 				second := (first + 1) % len(stores)
 				b := stores[second]
 				state, err := a.getCheckerState()

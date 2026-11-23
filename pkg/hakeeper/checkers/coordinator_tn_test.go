@@ -481,6 +481,7 @@ func TestRejectedMembershipCanBeRescheduled(t *testing.T) {
 		require.NoError(t, err)
 		return result
 	}
+	apply(hakeeper.GetInitialClusterRequestCmd(1, 1, 3, 0, nil, nil))
 	shard := pb.LogShardInfo{ShardID: 1, Epoch: 7, LeaderID: 1, Replicas: map[uint64]string{1: "a", 2: "b", 3: "c"}}
 	heartbeat := func(uuid string, id uint64) pb.CommandBatch {
 		t.Helper()

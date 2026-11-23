@@ -145,13 +145,13 @@ func Repair(
 }
 
 // RecordForShard returns the checker's desired configuration for the shard.
-func RecordForShard(shardID uint64, shards []metadata.LogShardRecord) metadata.LogShardRecord {
+func RecordForShard(shardID uint64, shards []metadata.LogShardRecord) (metadata.LogShardRecord, bool) {
 	for _, record := range shards {
 		if record.ShardID == shardID {
-			return record
+			return record, true
 		}
 	}
-	return metadata.LogShardRecord{}
+	return metadata.LogShardRecord{}, false
 }
 
 // StoreIncarnationChanged reports whether a replica belongs to an old store generation.
