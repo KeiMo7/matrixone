@@ -17,6 +17,7 @@ package logservice
 import (
 	"testing"
 
+	"github.com/matrixorigin/matrixone/pkg/hakeeper/logreplicas"
 	"github.com/matrixorigin/matrixone/pkg/pb/logservice"
 	"github.com/stretchr/testify/assert"
 )
@@ -127,6 +128,9 @@ func TestFilterLocality(t *testing.T) {
 		required logservice.Locality
 		expect   bool
 	}{
+		{store: logservice.Locality{}, required: logservice.Locality{}, expect: true},
+		{store: logservice.Locality{Value: map[string]string{"zone": "a"}}, required: logservice.Locality{}, expect: false},
+		{store: logservice.Locality{}, required: logservice.Locality{Value: map[string]string{"zone": ""}}, expect: false},
 		{
 			store: logservice.Locality{
 				Value: map[string]string{
@@ -175,7 +179,7 @@ func TestFilterLocality(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		r := filterLocality(c.store, c.required)
+		r := logreplicas.EligibleLocality(c.store, c.required)
 		assert.Equal(t, c.expect, r)
 	}
 }

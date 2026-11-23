@@ -23,13 +23,13 @@ import (
 // LogMembershipTargets returns reporting, retained voters that can submit the
 // change with a reporting majority in both configurations.
 func LogMembershipTargets(cfg Config, state pb.LogState, tick uint64, change pb.ConfigChangeType, replica pb.Replica) []string {
-	targets, _ := logMembershipTargets(cfg.LogStoreTimeoutTicks(), true, state, tick, change, replica, "")
+	targets, _ := logMembershipTargets(cfg.LogStoreTimeoutTicks(), state, tick, change, replica, "")
 	return targets
 }
 
 // An empty target collects sorted executors; a non-empty target checks one
 // executor without allocating a list.
-func logMembershipTargets(timeoutTicks uint64, checkExpiry bool, state pb.LogState, tick uint64, change pb.ConfigChangeType, replica pb.Replica, target string) ([]string, bool) {
+func logMembershipTargets(timeoutTicks uint64, state pb.LogState, tick uint64, change pb.ConfigChangeType, replica pb.Replica, target string) ([]string, bool) {
 	shard, ok := state.Shards[replica.ShardID]
 	n := len(shard.Replicas)
 	if !ok || shard.Epoch != replica.Epoch || n == 0 {
@@ -48,7 +48,7 @@ func logMembershipTargets(timeoutTicks uint64, checkExpiry bool, state pb.LogSta
 		}
 	case pb.AddReplica, pb.AddNonVotingReplica:
 		store, exists := state.Stores[replica.UUID]
-		if replica.UUID == "" || !exists || (checkExpiry && timeoutTicks+store.Tick < tick) {
+		if replica.UUID == "" || !exists || timeoutTicks+store.Tick < tick {
 			return nil, false
 		}
 		if _, exists := shard.Replicas[replica.ReplicaID]; exists {
@@ -89,7 +89,7 @@ func logMembershipTargets(timeoutTicks uint64, checkExpiry bool, state pb.LogSta
 	retained := 0
 	for id, uuid := range shard.Replicas {
 		store, exists := state.Stores[uuid]
-		if !exists || (checkExpiry && timeoutTicks+store.Tick < tick) {
+		if !exists || timeoutTicks+store.Tick < tick {
 			continue
 		}
 		oldIncarnation := shard.ReplicaStoreIncarnations[id]

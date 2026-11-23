@@ -1274,6 +1274,7 @@ func TestHAKeeperSnapshotEnvelopeRejectsInvalidPayloadWithoutMutation(t *testing
 
 func TestViewMetadataAdmissionFencesLateHAKeeperMember(t *testing.T) {
 	rsm := NewStateMachine(0, 1).(*stateMachine)
+	rsm.state.ClusterInfo.LogShards = []metadata.LogShardRecord{{ShardID: DefaultHAKeeperShardID, NumberOfReplicas: 3}}
 	rsm.state.LogStoreTimeoutPolicyTerm = 1
 	rsm.state.LogStoreTimeoutPolicyTicks = testLogStoreTimeoutTicks
 	rsm.state.ViewMetadataAdmissionEnabled = true

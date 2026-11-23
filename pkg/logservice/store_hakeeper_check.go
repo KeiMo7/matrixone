@@ -327,11 +327,8 @@ func (l *store) bootstrapStatusLogAllowed() bool {
 }
 
 func (l *store) logStoreTimeoutPolicyReady(state *pb.CheckerState, term uint64) bool {
-	if term == 0 || state.LogStoreTimeoutPolicyTerm > term {
+	if term == 0 || state.LogStoreTimeoutPolicyTerm == 0 || state.LogStoreTimeoutPolicyTerm > term {
 		return false
-	}
-	if state.LogStoreTimeoutPolicyTerm == 0 {
-		return true
 	}
 	cfg := l.cfg.GetHAKeeperConfig()
 	cfg.Fill()
@@ -370,8 +367,8 @@ func (l *store) hakeeperCheck() *pb.CheckerState {
 		}
 	}
 	cancel()
-	// After policy activation, a new leader with a different timeout must first
-	// publish it before scheduling against the delivery policy.
+	// Schedule only after a policy is committed. A new leader with a different
+	// timeout must publish it before scheduling against the delivery policy.
 	if !l.logStoreTimeoutPolicyReady(state, term) {
 		return state
 	}
@@ -427,7 +424,7 @@ func (l *store) handleBootstrapFailure() {
 func (l *store) healthCheck(term uint64, state *pb.CheckerState) {
 	l.assertHAKeeperState(pb.HAKeeperRunning)
 	defer l.assertHAKeeperState(pb.HAKeeperRunning)
-	cmds, err := l.getScheduleCommand(true, term, state)
+	cmds, err := l.getScheduleCommand(true, state)
 	if err != nil {
 		l.runtime.Logger().Error("failed to get check schedule commands", zap.Error(err))
 		return
@@ -485,7 +482,7 @@ func (l *store) bootstrap(term uint64, state *pb.CheckerState) error {
 		}
 		return nil
 	}
-	cmds, err := l.getScheduleCommand(false, term, state)
+	cmds, err := l.getScheduleCommand(false, state)
 	if err != nil {
 		if l.bootstrapStatusLogAllowed() {
 			l.runtime.Logger().Error("failed to get bootstrap schedule commands", zap.Error(err))
@@ -647,8 +644,7 @@ func (l *store) readCheckerState(ctx context.Context, query *hakeeper.StateQuery
 	return s.(*pb.CheckerState), nil
 }
 
-func (l *store) getScheduleCommand(check bool,
-	term uint64, state *pb.CheckerState) ([]pb.ScheduleCommand, error) {
+func (l *store) getScheduleCommand(check bool, state *pb.CheckerState) ([]pb.ScheduleCommand, error) {
 	if alloc, ok := l.alloc.(*idAllocator); ok {
 		alloc.discardForRestoreGeneration(state.IDWatermarkRestoreGeneration)
 	}

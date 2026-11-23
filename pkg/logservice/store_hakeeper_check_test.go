@@ -59,7 +59,7 @@ func TestLogStoreTimeoutPolicyReady(t *testing.T) {
 		state pb.CheckerState
 		want  bool
 	}{
-		{name: "not committed", term: 2, want: true},
+		{name: "not committed", term: 2},
 		{name: "previous leader, same timeout", term: 2, state: pb.CheckerState{LogStoreTimeoutPolicyTerm: 1, LogStoreTimeoutPolicyTicks: cfg.LogStoreTimeoutTicks()}, want: true},
 		{name: "future term", term: 1, state: pb.CheckerState{LogStoreTimeoutPolicyTerm: 2, LogStoreTimeoutPolicyTicks: cfg.LogStoreTimeoutTicks()}},
 		{name: "previous leader, different timeout", term: 2, state: pb.CheckerState{LogStoreTimeoutPolicyTerm: 1, LogStoreTimeoutPolicyTicks: cfg.LogStoreTimeoutTicks() + 1}},

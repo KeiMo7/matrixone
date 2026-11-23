@@ -39,6 +39,7 @@ func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 	seeds := make([]string, 0, len(configs))
 	for i := range configs {
 		configs[i] = getServiceTestConfig()
+		configs[i].RTTMillisecond = 100
 		configs[i].DataDir = t.TempDir()
 		configs[i].SnapshotExportDir = filepath.Join(configs[i].DataDir, "exported-snapshot")
 		configs[i].FS = vfs.Default
@@ -75,13 +76,11 @@ func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 	readMembership := func(s *Service, shard uint64, expected map[uint64]string) *dragonboat.Membership {
 		t.Helper()
 		var membership *dragonboat.Membership
-		require.Eventually(t, func() bool {
-			attempt, stop := context.WithTimeout(ctx, 300*time.Millisecond)
-			defer stop()
+		waitForRecovery(t, ctx, "exact Raft membership", 12*time.Second, 300*time.Millisecond, func(attempt context.Context) bool {
 			var err error
 			membership, err = s.store.nh.SyncGetShardMembership(attempt, shard)
 			return err == nil && maps.Equal(membership.Nodes, expected)
-		}, 12*time.Second, 30*time.Millisecond)
+		})
 		return membership
 	}
 	a, b, c := services[0], services[1], services[2]
@@ -101,13 +100,11 @@ func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 	clientConfig := configs[2].GetHAKeeperClientConfig()
 	clientConfig.ServiceAddresses = []string{configs[0].LogServiceServiceAddr()}
 	var client LogHAKeeperClient
-	require.Eventually(t, func() bool {
-		attempt, stop := context.WithTimeout(ctx, time.Second)
-		defer stop()
+	waitForRecovery(t, ctx, "HAKeeper client", 10*time.Second, time.Second, func(attempt context.Context) bool {
 		var err error
 		client, err = NewLogHAKeeperClient(attempt, c.ID(), clientConfig)
 		return err == nil
-	}, 10*time.Second, 50*time.Millisecond)
+	})
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
 	for i, service := range services {
 		hb := recoveryHeartbeat(t, ctx, service, 1, uint64(i+11), dataMembers)
@@ -136,19 +133,17 @@ func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 	stop()
 	require.Error(t, err, "one surviving data voter must not commit")
 	readMembership(c, 0, members)
-	require.Eventually(t, func() bool {
-		attempt, stop := context.WithTimeout(ctx, time.Second)
-		defer stop()
+	waitForRecovery(t, ctx, "reopened HAKeeper client", 10*time.Second, time.Second, func(attempt context.Context) bool {
 		var err error
 		c.haClient, err = NewLogHAKeeperClient(attempt, c.ID(), clientConfig)
 		return err == nil
-	}, 10*time.Second, 50*time.Millisecond)
+	})
 	_, err = c.haClient.SendLogHeartbeat(ctx, c.store.getHeartbeatMessage())
 	require.NoError(t, err)
 	wrong := pb.ScheduleCommand{UUID: c.ID(), ServiceType: pb.LogService,
 		ConfigChange: &pb.ConfigChange{ChangeType: pb.StartReplica, Replica: pb.Replica{ShardID: 1, ReplicaID: 12, UUID: c.ID()}}}
 	var term uint64
-	require.Eventually(t, func() bool {
+	waitForRecovery(t, ctx, "HAKeeper leader", 10*time.Second, time.Second, func(context.Context) bool {
 		for _, service := range []*Service{a, c} {
 			leader, current, err := service.store.isLeaderHAKeeper()
 			if err == nil && leader {
@@ -157,7 +152,7 @@ func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 			}
 		}
 		return false
-	}, 10*time.Second, 30*time.Millisecond)
+	})
 	_, err = a.store.nh.SyncPropose(ctx, a.store.nh.GetNoOPSession(0), hakeeper.GetUpdateCommandsCmd(term, []pb.ScheduleCommand{wrong}))
 	require.NoError(t, err)
 	delivered, err := c.haClient.SendLogHeartbeat(ctx, c.store.getHeartbeatMessage())
@@ -172,17 +167,13 @@ func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 	c.handleCommands(context.Background(), []pb.ScheduleCommand{shutdown, start})
 	readMembership(c, 1, dataMembers)
 	var next uint64
-	require.Eventually(t, func() bool {
-		attempt, stop := context.WithTimeout(ctx, 500*time.Millisecond)
-		defer stop()
+	waitForRecovery(t, ctx, "post-recovery write", 10*time.Second, 500*time.Millisecond, func(attempt context.Context) bool {
 		result, err := a.store.nh.SyncPropose(attempt, a.store.nh.GetNoOPSession(1), getTestUserEntry())
 		next = result.Value
 		return err == nil && next > old.Value
-	}, 10*time.Second, 30*time.Millisecond)
-	require.Eventually(t, func() bool {
-		attempt, stop := context.WithTimeout(ctx, 300*time.Millisecond)
-		defer stop()
+	})
+	waitForRecovery(t, ctx, "post-recovery read", 10*time.Second, 300*time.Millisecond, func(attempt context.Context) bool {
 		lsn, err := c.store.getLatestLsn(attempt, 1)
 		return err == nil && lsn >= next
-	}, 10*time.Second, 30*time.Millisecond)
+	})
 }

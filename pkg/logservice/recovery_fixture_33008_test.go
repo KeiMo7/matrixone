@@ -24,6 +24,29 @@ import (
 	pb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
 )
 
+// waitForRecovery runs each probe synchronously so a timeout cannot leave a
+// callback using a service after test cleanup has started.
+func waitForRecovery(t *testing.T, ctx context.Context, what string, timeout, attemptTimeout time.Duration, probe func(context.Context) bool) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	ticker := time.NewTicker(30 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		attempt, stop := context.WithTimeout(ctx, attemptTimeout)
+		ready := probe(attempt)
+		stop()
+		if ready {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("waiting for %s: %v", what, ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
 // Raft resolves NodeHost IDs through gossip. Start elections only after each
 // test host has received the metadata for the other hosts.
 func waitForRecoveryPeers(t *testing.T, ctx context.Context, services []*Service) {

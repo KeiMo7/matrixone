@@ -15,6 +15,7 @@
 package hakeeper
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/gogo/protobuf/proto"
@@ -76,4 +77,26 @@ func TestLogHeartbeatAuthorizesStartsWithoutChangingDeliveryState(t *testing.T) 
 	pending := machine.state.ScheduleCommands[store]
 	require.Equal(t, []pb.ScheduleCommand{bootstrap}, pending.Commands)
 	require.Equal(t, []pb.ScheduleCommandID{ids[6]}, pending.CommandIDs)
+}
+
+func TestReleasedLogHeartbeatKeepsHistoricalStartResponse(t *testing.T) {
+	for _, guarded := range []bool{false, true} {
+		t.Run(fmt.Sprintf("guarded=%t", guarded), func(t *testing.T) {
+			s := NewStateMachine(0, 1).(*stateMachine)
+			shard := pb.LogShardInfo{ShardID: 1, Epoch: 7, Replicas: map[uint64]string{1: "a"}}
+			s.state.LogState.Shards[1] = shard
+			start := pb.ScheduleCommand{UUID: "a", ServiceType: pb.LogService, ConfigChange: &pb.ConfigChange{
+				ChangeType: pb.StartReplica, Replica: pb.Replica{UUID: "a", ShardID: 1, ReplicaID: 2},
+			}}
+			unhappyQueue(t, s, start)
+			hb := pb.LogStoreHeartbeat{UUID: "a", Replicas: []pb.LogReplicaInfo{{LogShardInfo: shard, ReplicaID: 1}}}
+			got := membershipHeartbeat(t, s, hb, guarded)
+			if guarded {
+				require.Empty(t, got.Commands)
+			} else {
+				require.Equal(t, []pb.ScheduleCommand{start}, got.Commands)
+			}
+			require.NotContains(t, s.state.ScheduleCommands, "a")
+		})
+	}
 }

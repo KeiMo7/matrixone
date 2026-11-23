@@ -96,6 +96,7 @@ func (c *Controller) GetExecutingReplicas() ExecutingReplicas {
 					executing.Starting[shardID] = append(executing.Starting[shardID], step.ReplicaID)
 				case BootstrapShard:
 					executing.Bootstrapping[shardID] = struct{}{}
+					executing.Starting[shardID] = append(executing.Starting[shardID], step.ReplicaID)
 				}
 			}
 		}

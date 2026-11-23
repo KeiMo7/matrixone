@@ -358,7 +358,7 @@ func (a BootstrapShard) IsFinish(state ClusterState) bool {
 		return true
 	}
 	for _, replicaInfo := range state.LogState.Stores[a.UUID].Replicas {
-		if replicaInfo.ShardID == a.ShardID {
+		if replicaInfo.ShardID == a.ShardID && replicaInfo.ReplicaID == a.ReplicaID && !replicaInfo.IsNonVoting {
 			return true
 		}
 	}

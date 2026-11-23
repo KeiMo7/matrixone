@@ -21,6 +21,7 @@ import (
 
 	"github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/hakeeper"
+	"github.com/matrixorigin/matrixone/pkg/hakeeper/logreplicas"
 	"github.com/matrixorigin/matrixone/pkg/hakeeper/operator"
 	pb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
 	"github.com/matrixorigin/matrixone/pkg/pb/metadata"
@@ -318,8 +319,8 @@ func (cr *checkToRemove) check() []*operator.Operator {
 			shard := cr.lc.logState.Shards[shardID]
 			reported := func(r replica) bool {
 				_, live := cr.lc.workingStores[r.uuid]
-				return live && !replicaStoreIncarnationChanged(r.replicaID, r.uuid, shard.ReplicaStoreIncarnations, cr.lc.logState.Stores) &&
-					replicaStarted(shardID, r.replicaID, change == pb.RemoveNonVotingReplica, cr.lc.logState.Stores[r.uuid].Replicas)
+				return live && !logreplicas.StoreIncarnationChanged(r.replicaID, r.uuid, shard.ReplicaStoreIncarnations, cr.lc.logState.Stores) &&
+					logreplicas.Reported(shardID, r.replicaID, change == pb.RemoveNonVotingReplica, cr.lc.logState.Stores[r.uuid].Replicas)
 			}
 			slices.SortFunc(replicasToRemove, func(a, b replica) int {
 				aReported, bReported := reported(a), reported(b)

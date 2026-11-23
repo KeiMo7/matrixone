@@ -1374,6 +1374,8 @@ func TestCommandDeliveryActivationWaitsForServiceCapabilities(t *testing.T) {
 
 func TestCommandDeliveryActivationWaitsForPendingHAKeeperAdmission(t *testing.T) {
 	rsm := NewStateMachine(0, 1).(*stateMachine)
+	rsm.state.LogStoreTimeoutPolicyTerm = 1
+	rsm.state.LogStoreTimeoutPolicyTicks = testLogStoreTimeoutTicks
 	rsm.state.LogState.Shards[DefaultHAKeeperShardID] = pb.LogShardInfo{
 		ShardID:  DefaultHAKeeperShardID,
 		Replicas: map[uint64]string{1: "log-1"},
@@ -1455,6 +1457,8 @@ func TestHAKeeperAdmissionWaitsForCapableTarget(t *testing.T) {
 				rsm.state.LogStoreTimeoutPolicyTicks = testLogStoreTimeoutTicks
 				rsm.state.CommandDeliveryPreparing = transition.preparing
 				rsm.state.CommandDeliveryEnabled = transition.enabled
+				rsm.state.ClusterInfo.LogShards = []metadata.LogShardRecord{{ShardID: DefaultHAKeeperShardID, NumberOfReplicas: 3}}
+				rsm.state.NonVotingReplicaNum = 1
 				rsm.state.LogState.Stores["legacy"] = pb.LogStoreInfo{}
 				shard := pb.LogShardInfo{ShardID: DefaultHAKeeperShardID, Epoch: 1}
 				if changeType == pb.AddReplica || changeType == pb.AddNonVotingReplica {

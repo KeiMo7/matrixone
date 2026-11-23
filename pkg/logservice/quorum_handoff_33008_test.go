@@ -16,6 +16,7 @@ package logservice
 
 import (
 	"context"
+	"maps"
 	"path/filepath"
 	"testing"
 	"time"
@@ -53,6 +54,7 @@ func TestDeliveredExistingHAKeeperStartRestoresQuorum(t *testing.T) {
 	seeds := make([]string, 0, len(configs))
 	for i := range configs {
 		configs[i] = getServiceTestConfig()
+		configs[i].RTTMillisecond = 100
 		configs[i].DataDir = t.TempDir()
 		configs[i].SnapshotExportDir = filepath.Join(configs[i].DataDir, "exported-snapshot")
 		configs[i].FS = vfs.Default
@@ -88,31 +90,25 @@ func TestDeliveredExistingHAKeeperStartRestoresQuorum(t *testing.T) {
 	}
 	a, b, c := services[0], services[1], services[2]
 	var initial *dragonboat.Membership
-	require.Eventually(t, func() bool {
-		attempt, stop := context.WithTimeout(ctx, 300*time.Millisecond)
-		defer stop()
+	waitForRecovery(t, ctx, "initial two-voter membership", 12*time.Second, 300*time.Millisecond, func(attempt context.Context) bool {
 		var err error
 		initial, err = a.store.nh.SyncGetShardMembership(attempt, 0)
-		return err == nil && len(initial.Nodes) == 2
-	}, 12*time.Second, 30*time.Millisecond)
+		return err == nil && maps.Equal(initial.Nodes, map[uint64]string{1: members[1], 2: members[2]})
+	})
 	require.NoError(t, a.store.nh.SyncRequestAddReplica(ctx, 0, 3, c.ID(), initial.ConfigChangeID))
 	require.NoError(t, c.store.startHAKeeperReplica(3, nil, true))
-	require.Eventually(t, func() bool {
-		attempt, stop := context.WithTimeout(ctx, 300*time.Millisecond)
-		defer stop()
+	waitForRecovery(t, ctx, "three-voter membership", 12*time.Second, 300*time.Millisecond, func(attempt context.Context) bool {
 		membership, err := a.store.nh.SyncGetShardMembership(attempt, 0)
-		return err == nil && len(membership.Nodes) == 3
-	}, 12*time.Second, 30*time.Millisecond)
+		return err == nil && maps.Equal(membership.Nodes, members)
+	})
 	clientConfig := configs[2].GetHAKeeperClientConfig()
 	clientConfig.ServiceAddresses = []string{configs[0].LogServiceServiceAddr()}
 	var client LogHAKeeperClient
-	require.Eventually(t, func() bool {
-		attempt, stop := context.WithTimeout(ctx, time.Second)
-		defer stop()
+	waitForRecovery(t, ctx, "HAKeeper client", 10*time.Second, time.Second, func(attempt context.Context) bool {
 		var err error
 		client, err = NewLogHAKeeperClient(attempt, c.ID(), clientConfig)
 		return err == nil
-	}, 10*time.Second, 50*time.Millisecond)
+	})
 	t.Cleanup(func() { require.NoError(t, client.Close()) })
 	for i, service := range services {
 		hb := recoveryHeartbeat(t, ctx, service, 0, uint64(i+1), members)
@@ -131,7 +127,7 @@ func TestDeliveredExistingHAKeeperStartRestoresQuorum(t *testing.T) {
 	start := pb.ScheduleCommand{UUID: c.ID(), ServiceType: pb.LogService,
 		ConfigChange: &pb.ConfigChange{ChangeType: pb.StartReplica, Replica: pb.Replica{ShardID: 0, ReplicaID: 3, UUID: c.ID()}}}
 	var term uint64
-	require.Eventually(t, func() bool {
+	waitForRecovery(t, ctx, "HAKeeper leader", 10*time.Second, time.Second, func(context.Context) bool {
 		for _, s := range []*Service{a, b} {
 			leader, current, err := s.store.isLeaderHAKeeper()
 			if err == nil && leader {
@@ -140,7 +136,7 @@ func TestDeliveredExistingHAKeeperStartRestoresQuorum(t *testing.T) {
 			}
 		}
 		return false
-	}, 10*time.Second, 30*time.Millisecond)
+	})
 	_, err := a.store.nh.SyncPropose(ctx, a.store.nh.GetNoOPSession(0), hakeeper.GetUpdateCommandsCmd(term, []pb.ScheduleCommand{start}))
 	require.NoError(t, err)
 	c.haClient = &handoffHeartbeatClient{LogHAKeeperClient: client, afterDelivery: func(batch pb.CommandBatch) {
@@ -155,12 +151,10 @@ func TestDeliveredExistingHAKeeperStartRestoresQuorum(t *testing.T) {
 	// Exercise the real heartbeat path, including its health check between
 	// receipt and command handling, with quorum lost at the handoff.
 	c.heartbeat(ctx)
-	require.Eventually(t, func() bool {
-		attempt, stop := context.WithTimeout(ctx, 300*time.Millisecond)
-		defer stop()
+	waitForRecovery(t, ctx, "recovered three-voter membership", 12*time.Second, 300*time.Millisecond, func(attempt context.Context) bool {
 		membership, err := c.store.nh.SyncGetShardMembership(attempt, 0)
-		return err == nil && len(membership.Nodes) == 3
-	}, 12*time.Second, 30*time.Millisecond)
+		return err == nil && maps.Equal(membership.Nodes, members)
+	})
 	_, err = c.haClient.SendLogHeartbeat(ctx, c.store.getHeartbeatMessage())
 	require.NoError(t, err, "the restored quorum must accept a replicated heartbeat")
 }

@@ -32,6 +32,7 @@ import (
 	"github.com/mohae/deepcopy"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/hakeeper/logreplicas"
 	pb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
 	"github.com/matrixorigin/matrixone/pkg/pb/metadata"
 )
@@ -545,8 +546,8 @@ func (s *stateMachine) handleUpdateCommandsCmd(cmd []byte) sm.Result {
 			s.state.ScheduleCommands = make(map[string]pb.CommandBatch)
 		}
 	} else {
-		// Preserve the legacy replacement contract until the cluster-wide
-		// capability transition has entered its preparation barrier.
+		// Legacy batches replace the previous schedule. The checker rebuilds
+		// needed work from the current replicated state.
 		s.state.ScheduleCommands = make(map[string]pb.CommandBatch)
 	}
 	for _, c := range b.Commands {
@@ -816,7 +817,9 @@ func (s *stateMachine) getCommandBatchFiltered(
 			}
 			mustWait := hb != nil && !s.logScheduleCommandDeliverable(cmd)
 			if !mustWait && guarded && isLogMembershipChange(cmd) {
-				if !s.logMembershipDeliverable(uuid, cmd) {
+				if s.state.LogStoreTimeoutPolicyTerm == 0 {
+					mustWait = true
+				} else if !s.logMembershipDeliverable(uuid, cmd) {
 					continue
 				}
 			}
@@ -827,7 +830,7 @@ func (s *stateMachine) getCommandBatchFiltered(
 				}
 				continue
 			}
-			if hb == nil || s.logStartDeliverable(uuid, hb.StoreIncarnation, cmd) {
+			if hb == nil || !guarded || s.logStartDeliverable(uuid, hb.StoreIncarnation, cmd) {
 				deliver = append(deliver, cmd)
 				if deliverIDs != nil {
 					deliverIDs = append(deliverIDs, batch.CommandIDs[i])
@@ -875,17 +878,55 @@ func isLogMembershipChange(cmd pb.ScheduleCommand) bool {
 	}
 }
 
-// logMembershipDeliverable reuses the scheduler's reporting-quorum rule after
-// this heartbeat updates replicated observations. Before the first policy tick,
-// report withdrawals still apply, but report age cannot yet be evaluated.
+// logMembershipDeliverable reuses the scheduler's reporting-quorum rule with
+// the committed timeout policy and the latest replicated observations.
 func (s *stateMachine) logMembershipDeliverable(uuid string, cmd pb.ScheduleCommand) bool {
 	if uuid == "" {
 		return false
 	}
 	change := cmd.ConfigChange
-	_, matched := logMembershipTargets(s.state.LogStoreTimeoutPolicyTicks, s.state.LogStoreTimeoutPolicyTerm != 0,
+	_, matched := logMembershipTargets(s.state.LogStoreTimeoutPolicyTicks,
 		s.state.LogState, s.state.Tick, change.ChangeType, change.Replica, uuid)
-	return matched
+	if !matched {
+		return false
+	}
+
+	// A safe quorum does not imply the old operation is still needed. Use the
+	// checker's current per-shard plan at the point of delivery, particularly
+	// when a store or the requested non-voting replica count has recovered.
+	shard := s.state.LogState.Shards[change.Replica.ShardID]
+	record := logreplicas.RecordForShard(shard.ShardID, s.state.ClusterInfo.LogShards)
+	var expired []string
+	for _, members := range []map[uint64]string{shard.Replicas, shard.NonVotingReplicas} {
+		for _, member := range members {
+			if store, ok := s.state.LogState.Stores[member]; ok &&
+				s.state.LogStoreTimeoutPolicyTicks+store.Tick < s.state.Tick {
+				expired = append(expired, member)
+			}
+		}
+	}
+	normal, nonVoting := logreplicas.Repair(record, s.state.NonVotingReplicaNum,
+		shard, expired, s.state.LogState.Stores)
+	switch change.ChangeType {
+	case pb.RemoveReplica:
+		_, retained := normal.Replicas[change.Replica.ReplicaID]
+		return !retained
+	case pb.RemoveNonVotingReplica:
+		_, retained := nonVoting.Replicas[change.Replica.ReplicaID]
+		return !retained
+	case pb.AddReplica, pb.AddNonVotingReplica:
+		// The checker bootstraps an empty voting group instead of adding to it.
+		if record.NumberOfReplicas == 0 || uint64(normal.ToAdd) == record.NumberOfReplicas {
+			return false
+		}
+		wanted, locality := normal.ToAdd, pb.Locality{}
+		if change.ChangeType == pb.AddNonVotingReplica {
+			wanted, locality = nonVoting.ToAdd, s.state.NonVotingLocality
+		}
+		return wanted > 0 && logreplicas.EligibleLocality(s.state.LogState.Stores[change.Replica.UUID].Locality, locality)
+	default:
+		return false
+	}
 }
 
 // hakeeperAdmissionTarget returns the LogStore that a schedule command would

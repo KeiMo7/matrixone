@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/hakeeper"
+	"github.com/matrixorigin/matrixone/pkg/hakeeper/logreplicas"
 	pb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
 	"github.com/matrixorigin/matrixone/pkg/pb/metadata"
 	"github.com/stretchr/testify/assert"
@@ -101,8 +102,8 @@ func TestFixedLogShardInfo(t *testing.T) {
 		info          pb.LogShardInfo
 		expiredStores []string
 
-		expectedNormal    *fixingShard
-		expectedNonVoting *fixingShard
+		expectedNormal    *logreplicas.Plan
+		expectedNonVoting *logreplicas.Plan
 	}{
 		{
 			desc: "normal case",
@@ -114,14 +115,12 @@ func TestFixedLogShardInfo(t *testing.T) {
 				ShardID:  1,
 				Replicas: map[uint64]string{1: "a", 2: "b", 3: "c"},
 			},
-			expectedNormal: &fixingShard{
-				shardID:  1,
-				replicas: map[uint64]string{1: "a", 2: "b", 3: "c"},
-				toAdd:    0,
+			expectedNormal: &logreplicas.Plan{
+				Replicas: map[uint64]string{1: "a", 2: "b", 3: "c"},
+				ToAdd:    0,
 			},
-			expectedNonVoting: &fixingShard{
-				shardID:  1,
-				replicas: map[uint64]string{},
+			expectedNonVoting: &logreplicas.Plan{
+				Replicas: map[uint64]string{},
 			},
 		},
 		{
@@ -134,14 +133,12 @@ func TestFixedLogShardInfo(t *testing.T) {
 				ShardID:  1,
 				Replicas: map[uint64]string{1: "a", 2: "b"},
 			},
-			expectedNormal: &fixingShard{
-				shardID:  1,
-				replicas: map[uint64]string{1: "a", 2: "b"},
-				toAdd:    1,
+			expectedNormal: &logreplicas.Plan{
+				Replicas: map[uint64]string{1: "a", 2: "b"},
+				ToAdd:    1,
 			},
-			expectedNonVoting: &fixingShard{
-				shardID:  1,
-				replicas: map[uint64]string{},
+			expectedNonVoting: &logreplicas.Plan{
+				Replicas: map[uint64]string{},
 			},
 		},
 		{
@@ -155,14 +152,12 @@ func TestFixedLogShardInfo(t *testing.T) {
 				Replicas: map[uint64]string{1: "a", 2: "b", 3: "c"},
 				LeaderID: 2,
 			},
-			expectedNormal: &fixingShard{
-				shardID:  1,
-				replicas: map[uint64]string{2: "b"},
-				toAdd:    0,
+			expectedNormal: &logreplicas.Plan{
+				Replicas: map[uint64]string{2: "b"},
+				ToAdd:    0,
 			},
-			expectedNonVoting: &fixingShard{
-				shardID:  1,
-				replicas: map[uint64]string{},
+			expectedNonVoting: &logreplicas.Plan{
+				Replicas: map[uint64]string{},
 			},
 		},
 		{
@@ -176,15 +171,13 @@ func TestFixedLogShardInfo(t *testing.T) {
 				Replicas: map[uint64]string{1: "a", 2: "b", 3: "c"},
 			},
 			nonVotingReplicaNum: 3,
-			expectedNormal: &fixingShard{
-				shardID:  1,
-				replicas: map[uint64]string{1: "a", 2: "b", 3: "c"},
-				toAdd:    0,
+			expectedNormal: &logreplicas.Plan{
+				Replicas: map[uint64]string{1: "a", 2: "b", 3: "c"},
+				ToAdd:    0,
 			},
-			expectedNonVoting: &fixingShard{
-				shardID:  1,
-				replicas: map[uint64]string{},
-				toAdd:    3,
+			expectedNonVoting: &logreplicas.Plan{
+				Replicas: map[uint64]string{},
+				ToAdd:    3,
 			},
 		},
 		{
@@ -199,15 +192,13 @@ func TestFixedLogShardInfo(t *testing.T) {
 				NonVotingReplicas: map[uint64]string{4: "d", 5: "e", 6: "f"},
 			},
 			nonVotingReplicaNum: 3,
-			expectedNormal: &fixingShard{
-				shardID:  1,
-				replicas: map[uint64]string{1: "a", 2: "b", 3: "c"},
-				toAdd:    0,
+			expectedNormal: &logreplicas.Plan{
+				Replicas: map[uint64]string{1: "a", 2: "b", 3: "c"},
+				ToAdd:    0,
 			},
-			expectedNonVoting: &fixingShard{
-				shardID:  1,
-				replicas: map[uint64]string{4: "d", 5: "e", 6: "f"},
-				toAdd:    0,
+			expectedNonVoting: &logreplicas.Plan{
+				Replicas: map[uint64]string{4: "d", 5: "e", 6: "f"},
+				ToAdd:    0,
 			},
 		},
 		{
@@ -222,15 +213,13 @@ func TestFixedLogShardInfo(t *testing.T) {
 				NonVotingReplicas: map[uint64]string{4: "d", 5: "e"},
 			},
 			nonVotingReplicaNum: 3,
-			expectedNormal: &fixingShard{
-				shardID:  1,
-				replicas: map[uint64]string{1: "a", 2: "b", 3: "c"},
-				toAdd:    0,
+			expectedNormal: &logreplicas.Plan{
+				Replicas: map[uint64]string{1: "a", 2: "b", 3: "c"},
+				ToAdd:    0,
 			},
-			expectedNonVoting: &fixingShard{
-				shardID:  1,
-				replicas: map[uint64]string{4: "d", 5: "e"},
-				toAdd:    1,
+			expectedNonVoting: &logreplicas.Plan{
+				Replicas: map[uint64]string{4: "d", 5: "e"},
+				ToAdd:    1,
 			},
 		},
 		{
@@ -245,22 +234,20 @@ func TestFixedLogShardInfo(t *testing.T) {
 				NonVotingReplicas: map[uint64]string{4: "d", 5: "e", 6: "f", 7: "g"},
 			},
 			nonVotingReplicaNum: 3,
-			expectedNormal: &fixingShard{
-				shardID:  1,
-				replicas: map[uint64]string{1: "a", 2: "b", 3: "c"},
-				toAdd:    0,
+			expectedNormal: &logreplicas.Plan{
+				Replicas: map[uint64]string{1: "a", 2: "b", 3: "c"},
+				ToAdd:    0,
 			},
-			expectedNonVoting: &fixingShard{
-				shardID:  1,
-				replicas: map[uint64]string{5: "e", 6: "f", 7: "g"},
-				toAdd:    0,
+			expectedNonVoting: &logreplicas.Plan{
+				Replicas: map[uint64]string{5: "e", 6: "f", 7: "g"},
+				ToAdd:    0,
 			},
 		},
 	}
 
 	for i, c := range cases {
 		fmt.Printf("case %v: %s\n", i, c.desc)
-		normal, nonVoting := fixedLogShardInfo(c.record, c.nonVotingReplicaNum, c.info, c.expiredStores, nil)
+		normal, nonVoting := logreplicas.Repair(c.record, c.nonVotingReplicaNum, c.info, c.expiredStores, nil)
 		assert.Equal(t, c.expectedNormal, normal)
 		assert.Equal(t, c.expectedNonVoting, nonVoting)
 	}

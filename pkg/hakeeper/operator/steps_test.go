@@ -716,3 +716,23 @@ func TestLogRemovalCompletionUsesStoreAndShard(t *testing.T) {
 		})
 	}
 }
+
+// A bootstrap remains owned until its exact voting replica is reported.
+func TestBootstrapShardCompletion(t *testing.T) {
+	step := BootstrapShard{UUID: "a", ShardID: 1, ReplicaID: 3}
+	for _, tc := range []struct {
+		name     string
+		stores   map[string]pb.LogStoreInfo
+		finished bool
+	}{
+		{name: "store gone", finished: true},
+		{name: "not reported", stores: map[string]pb.LogStoreInfo{"a": {}}},
+		{name: "wrong identity", stores: map[string]pb.LogStoreInfo{"a": {Replicas: []pb.LogReplicaInfo{{LogShardInfo: pb.LogShardInfo{ShardID: 1}, ReplicaID: 4}}}}},
+		{name: "wrong role", stores: map[string]pb.LogStoreInfo{"a": {Replicas: []pb.LogReplicaInfo{{LogShardInfo: pb.LogShardInfo{ShardID: 1}, ReplicaID: 3, IsNonVoting: true}}}}},
+		{name: "reported", stores: map[string]pb.LogStoreInfo{"a": {Replicas: []pb.LogReplicaInfo{{LogShardInfo: pb.LogShardInfo{ShardID: 1}, ReplicaID: 3}}}}, finished: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.finished, step.IsFinish(ClusterState{LogState: pb.LogState{Stores: tc.stores}}))
+		})
+	}
+}
