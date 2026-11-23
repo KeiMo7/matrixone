@@ -60,11 +60,13 @@ func (s *Service) handleCommands(ctx context.Context, cmds []pb.ScheduleCommand)
 			continue
 		}
 		s.runtime.Logger().Info(fmt.Sprintf("%s applying cmd: %s", s.ID(), cmd.LogString()))
+		if change != nil {
+			s.runtime.Logger().Debug("applying schedule command:", zap.String("command", cmd.LogString()))
+		}
 		if ctx.Err() != nil && !isReplicaCleanup(change) {
 			continue
 		}
 		if change != nil {
-			s.runtime.Logger().Debug("applying schedule command:", zap.String("command", cmd.LogString()))
 			switch cmd.ConfigChange.ChangeType {
 			case pb.StartReplica:
 				s.handleStartReplica(cmd)
@@ -122,6 +124,10 @@ func (s *Service) handleCommands(ctx context.Context, cmds []pb.ScheduleCommand)
 		}
 		started := time.Now()
 		s.runtime.Logger().Info(fmt.Sprintf("%s applying cmd: %s", s.ID(), cmd.LogString()))
+		// A command admitted here may still complete after cancellation.
+		if ctx.Err() != nil {
+			break
+		}
 		switch cmd.ConfigChange.ChangeType {
 		case pb.AddReplica:
 			s.handleAddReplica(cmd)

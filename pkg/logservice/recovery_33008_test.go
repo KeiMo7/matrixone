@@ -60,6 +60,22 @@ func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 		require.NoError(t, err)
 		services[i] = s
 	}
+	connect := func(s *Service) LogHAKeeperClient {
+		t.Helper()
+		var client LogHAKeeperClient
+		require.Eventually(t, func() bool {
+			attempt, stop := context.WithTimeout(ctx, time.Second)
+			defer stop()
+			candidate, err := NewLogHAKeeperClient(attempt, s.ID(), configs[2].GetHAKeeperClientConfig())
+			if err != nil {
+				return false
+			}
+			client = candidate
+			return true
+		}, 10*time.Second, 50*time.Millisecond)
+		t.Cleanup(func() { require.NoError(t, client.Close()) })
+		return client
+	}
 	for i := range configs {
 		open(i)
 		t.Cleanup(func() {
@@ -67,11 +83,25 @@ func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 				require.NoError(t, services[i].Close())
 			}
 		})
-		if i < 2 {
-			initial := map[uint64]string{1: members[1], 2: members[2]}
-			require.NoError(t, services[i].store.startHAKeeperReplica(uint64(i+1), initial, false))
+	}
+	// The two initial voters need each other's Raft addresses before election.
+	require.Eventually(t, func() bool {
+		for i := 0; i < 2; i++ {
+			registry, ok := services[i].store.nh.GetNodeHostRegistry()
+			if !ok {
+				return false
+			}
+			peer := 1 - i
+			meta, ok := registry.GetMeta(services[peer].ID())
+			if !ok || string(meta) != configs[peer].LogServiceServiceAddr() {
+				return false
+			}
 		}
-		require.NoError(t, services[i].store.startReplica(1, uint64(i+1), members, false))
+		return true
+	}, 10*time.Second, 30*time.Millisecond, "initial voters must discover each other")
+	initialMembers := map[uint64]string{1: members[1], 2: members[2]}
+	for i := 0; i < 2; i++ {
+		require.NoError(t, services[i].store.startHAKeeperReplica(uint64(i+1), initialMembers, false))
 	}
 	// C is a previously joined voter, so this also exercises the released
 	// branch's ordinary join=true restart path as a regression control.
@@ -98,19 +128,15 @@ func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 		return membership
 	}
 	a, b, c := services[0], services[1], services[2]
-	readMembership(a, 0)
+	require.Equal(t, members, readMembership(c, 0).Nodes)
+	for i := range services {
+		require.NoError(t, services[i].store.startReplica(1, uint64(i+1), members, false))
+	}
 	readMembership(a, 1)
 	localHAID := atomic.LoadUint64(&a.store.haKeeperReplicaID)
 	require.Error(t, a.store.stopReplica(0, localHAID+100))
 	require.Equal(t, localHAID, atomic.LoadUint64(&a.store.haKeeperReplicaID), "a failed stop must not clear the live HAKeeper ID")
-	var client LogHAKeeperClient
-	require.Eventually(t, func() bool {
-		attempt, stop := context.WithTimeout(ctx, time.Second)
-		defer stop()
-		var err error
-		client, err = NewLogHAKeeperClient(attempt, c.ID(), configs[2].GetHAKeeperClientConfig())
-		return err == nil
-	}, 10*time.Second, 50*time.Millisecond)
+	client := connect(c)
 	for _, service := range services {
 		_, err := client.SendLogHeartbeat(ctx, service.store.getHeartbeatMessage())
 		require.NoError(t, err)
@@ -176,13 +202,7 @@ func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 	stop()
 	require.Error(t, err, "one surviving data voter must not commit")
 	readMembership(c, 0)
-	require.Eventually(t, func() bool {
-		attempt, stop := context.WithTimeout(ctx, time.Second)
-		defer stop()
-		var err error
-		c.haClient, err = NewLogHAKeeperClient(attempt, c.ID(), configs[2].GetHAKeeperClientConfig())
-		return err == nil
-	}, 10*time.Second, 50*time.Millisecond)
+	c.haClient = connect(c)
 	_, err = c.haClient.SendLogHeartbeat(ctx, c.store.getHeartbeatMessage())
 	require.NoError(t, err)
 	start := pb.ScheduleCommand{UUID: c.ID(), ServiceType: pb.LogService,
@@ -217,13 +237,7 @@ func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 	configs[2].SnapshotExportDir = filepath.Join(configs[2].DataDir, "exported-snapshot")
 	open(2)
 	c = services[2]
-	require.Eventually(t, func() bool {
-		attempt, stop := context.WithTimeout(ctx, time.Second)
-		defer stop()
-		var err error
-		c.haClient, err = NewLogHAKeeperClient(attempt, c.ID(), configs[2].GetHAKeeperClientConfig())
-		return err == nil
-	}, 10*time.Second, 50*time.Millisecond)
+	c.haClient = connect(c)
 	waitForReport := func(id uint64, present bool) pb.LogShardInfo {
 		t.Helper()
 		var observed pb.LogShardInfo

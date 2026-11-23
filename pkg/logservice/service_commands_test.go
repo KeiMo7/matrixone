@@ -54,17 +54,21 @@ func (c *cancelAfterHeartbeatClient) SendLogHeartbeat(context.Context, pb.LogSto
 }
 
 func TestScheduleCancellationStillProcessesLaterStop(t *testing.T) {
-	for _, dynamic := range []bool{false, true} {
-		name := "start"
-		if dynamic {
-			name = "dynamic bootstrap"
-		}
-		t.Run(name, func(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		dynamic    bool
+		logMessage string
+	}{
+		{name: "start", logMessage: " applying cmd: "},
+		{name: "start debug", logMessage: "applying schedule command:"},
+		{name: "dynamic bootstrap", dynamic: true, logMessage: " applying cmd: "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			runServiceTest(t, false, true, func(t *testing.T, s *Service) {
 				ctx, cancel := context.WithCancel(context.Background())
 				defer cancel()
 				logger := zap.NewExample(zap.Hooks(func(entry zapcore.Entry) error {
-					if strings.Contains(entry.Message, " applying cmd: ") {
+					if strings.Contains(entry.Message, tc.logMessage) {
 						cancel()
 					}
 					return nil
@@ -72,7 +76,7 @@ func TestScheduleCancellationStillProcessesLaterStop(t *testing.T) {
 				s.runtime = runtime.NewRuntime(metadata.ServiceType_LOG, s.ID(), logger)
 				start := pb.ScheduleCommand{UUID: s.ID(), ConfigChange: &pb.ConfigChange{ChangeType: pb.StartReplica,
 					Replica: pb.Replica{UUID: s.ID(), ShardID: 2, ReplicaID: 2}}}
-				if dynamic {
+				if tc.dynamic {
 					start.ConfigChange = nil
 					start.BootstrapShard = &pb.BootstrapShard{ShardID: 2, ReplicaID: 2, InitialMembers: map[uint64]string{2: s.ID()}}
 				}
@@ -87,7 +91,7 @@ func TestScheduleCancellationStillProcessesLaterStop(t *testing.T) {
 					return false
 				}
 				require.True(t, present())
-				if dynamic {
+				if tc.dynamic {
 					client := &cancelAfterHeartbeatClient{cancel: cancel, commands: []pb.ScheduleCommand{start, stop}}
 					s.haClient = client
 					s.heartbeat(ctx)
@@ -766,5 +770,61 @@ func TestScheduleValidationStopsOnServiceCancellation(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatal("validation did not stop after cancellation")
 		}
+	})
+}
+
+func TestMembershipCancellationAfterValidation(t *testing.T) {
+	runServiceTest(t, false, false, func(t *testing.T, s *Service) {
+		require.NoError(t, s.store.startReplica(2, 1, map[uint64]dragonboat.Target{1: s.ID()}, false))
+		var current *dragonboat.Membership
+		require.Eventually(t, func() bool {
+			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+			defer cancel()
+			var err error
+			current, err = s.store.nh.SyncGetShardMembership(ctx, 2)
+			return err == nil && len(current.Nodes) == 1
+		}, 10*time.Second, 30*time.Millisecond)
+		target := uuid.NewString()
+		shard := pb.LogShardInfo{ShardID: 2, Epoch: current.ConfigChangeID, Replicas: map[uint64]string{1: s.ID()}}
+		client := &scheduleStateClient{states: []pb.CheckerState{{Tick: 1, LogState: pb.LogState{
+			Shards: map[uint64]pb.LogShardInfo{2: shard},
+			Stores: map[string]pb.LogStoreInfo{
+				s.ID(): {Tick: 1, Replicas: []pb.LogReplicaInfo{{LogShardInfo: shard, ReplicaID: 1}}},
+				target: {Tick: 1},
+			},
+		}}}}
+		s.haClient = client
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		logger := zap.NewExample(zap.Hooks(func(entry zapcore.Entry) error {
+			if strings.Contains(entry.Message, " applying cmd: ") {
+				cancel()
+			}
+			return nil
+		}))
+		s.runtime = runtime.NewRuntime(metadata.ServiceType_LOG, s.ID(), logger)
+		cmd := pb.ScheduleCommand{UUID: s.ID(), ServiceType: pb.LogService,
+			ConfigChange: &pb.ConfigChange{ChangeType: pb.AddNonVotingReplica,
+				Replica: pb.Replica{UUID: target, ShardID: 2, ReplicaID: 9, Epoch: current.ConfigChangeID}}}
+		readMembership := func() *dragonboat.Membership {
+			t.Helper()
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			membership, err := s.store.nh.SyncGetShardMembership(ctx, 2)
+			require.NoError(t, err)
+			return membership
+		}
+		s.handleCommands(ctx, []pb.ScheduleCommand{cmd})
+		require.ErrorIs(t, ctx.Err(), context.Canceled)
+		require.Equal(t, 1, client.calls, "the command reached authorization before cancellation")
+		actual := readMembership()
+		require.Equal(t, current.ConfigChangeID, actual.ConfigChangeID)
+		require.NotContains(t, actual.NonVotings, uint64(9))
+
+		s.runtime = runtime.NewRuntime(metadata.ServiceType_LOG, s.ID(), zap.NewNop())
+		s.handleCommands(context.Background(), []pb.ScheduleCommand{cmd})
+		actual = readMembership()
+		require.Equal(t, target, actual.NonVotings[9], "the same command must succeed while active")
+		require.Greater(t, actual.ConfigChangeID, current.ConfigChangeID)
 	})
 }
