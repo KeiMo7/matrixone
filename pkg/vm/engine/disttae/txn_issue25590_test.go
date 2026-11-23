@@ -7685,9 +7685,10 @@ func TestIssue25590RecordedBeforeBoundaryKeepsObjectOutofQueue(t *testing.T) {
 
 	// The consumer records INSIDE the statement.
 	bat := issue25590Round21TombstoneStatsBatch(t, txn.proc.Mp(), stats)
+	defer bat.Clean(txn.proc.Mp())
 	require.NoError(t, txn.writeFileWithAutoIncrEpoch(DELETE, 1, issue25590DBID,
 		issue25590TableID, "db", "tbl", name, bat,
-		metadata.TNService{ServiceID: "issue25590-dn"}, 0))
+		catalogCreateTNStoreForTest(), 0))
 
 	// Commit preparation drafts the payload: the quiesced handoff runs
 	// first (recorded-recheck), nothing moves to the queue, and — G3 — the
@@ -7772,9 +7773,10 @@ func TestIssue25590ParkedCommitKeepsUnitAndFailureTransfersOnce(t *testing.T) {
 	txnA.UpdateSnapshotWriteOffset()
 	nameA, statsA, wA := issue25590Round21PushTombstone(t, txnA, failFS)
 	batA := issue25590Round21TombstoneStatsBatch(t, txnA.proc.Mp(), statsA)
+	defer batA.Clean(txnA.proc.Mp())
 	require.NoError(t, txnA.writeFileWithAutoIncrEpoch(DELETE, 1, issue25590DBID,
 		issue25590TableID, "db", "tbl", nameA, batA,
-		metadata.TNService{ServiceID: "issue25590-dn"}, 0))
+		catalogCreateTNStoreForTest(), 0))
 	wA.Close()
 	_, live, _ := issue25590LedgerNow(e)
 	require.Equal(t, int64(1), live, "the recorded object holds the bound's one unit")
@@ -7828,9 +7830,10 @@ func TestIssue25590ParkedCommitKeepsUnitAndFailureTransfersOnce(t *testing.T) {
 	issue25590BindRound21Txn(t, txnC)
 	nameC, statsC, wC := issue25590Round21PushTombstone(t, txnC, failFS)
 	batC := issue25590Round21TombstoneStatsBatch(t, txnC.proc.Mp(), statsC)
+	defer batC.Clean(txnC.proc.Mp())
 	require.NoError(t, txnC.writeFileWithAutoIncrEpoch(DELETE, 1, issue25590DBID,
 		issue25590TableID, "db", "tbl", nameC, batC,
-		metadata.TNService{ServiceID: "issue25590-dn"}, 0))
+		catalogCreateTNStoreForTest(), 0))
 	wC.Close()
 	_, err = txnC.Commit(ctx)
 	require.NoError(t, err)
@@ -7855,9 +7858,10 @@ func TestIssue25590ParkedCommitKeepsUnitAndFailureTransfersOnce(t *testing.T) {
 	issue25590BindRound21Txn(t, txnD)
 	nameD, statsD, wD := issue25590Round21PushTombstone(t, txnD, failFS)
 	batD := issue25590Round21TombstoneStatsBatch(t, txnD.proc.Mp(), statsD)
+	defer batD.Clean(txnD.proc.Mp())
 	require.NoError(t, txnD.writeFileWithAutoIncrEpoch(DELETE, 1, issue25590DBID,
 		issue25590TableID, "db", "tbl", nameD, batD,
-		metadata.TNService{ServiceID: "issue25590-dn"}, 0))
+		catalogCreateTNStoreForTest(), 0))
 	wD.Close()
 	_, err = txnD.Commit(ctx)
 	require.NoError(t, err)

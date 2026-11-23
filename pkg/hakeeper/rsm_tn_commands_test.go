@@ -48,7 +48,7 @@ func TestLegacyTNStartSnapshotReplayConverges(t *testing.T) {
 	}
 	require.Equal(t, recovered[0].state, recovered[1].state)
 	for _, r := range recovered {
-		for i, cmd := range [][]byte{GetEnableCommandDeliveryCmd(), GetTickCmd(), GetTNStoreHeartbeatCmd(heartbeat)} {
+		for i, cmd := range [][]byte{GetEnableCommandDeliveryCmd(), GetTickCmd(1, testLogStoreTimeoutTicks), GetTNStoreHeartbeatCmd(heartbeat)} {
 			_, err := r.Update(sm.Entry{Index: uint64(i + 3), Cmd: cmd})
 			require.NoError(t, err)
 		}

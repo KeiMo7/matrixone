@@ -15,6 +15,8 @@
 package logservice
 
 import (
+	"context"
+
 	"github.com/google/uuid"
 	"github.com/lni/vfs"
 	"github.com/matrixorigin/matrixone/pkg/common/morpc"
@@ -69,16 +71,18 @@ func newTestService(genCfg func() Config) (*Service, ClientConfig, error) {
 	}
 
 	cmd := pb.ScheduleCommand{
+		UUID: service.ID(),
 		ConfigChange: &pb.ConfigChange{
 			ChangeType: pb.StartReplica,
 			Replica: pb.Replica{
+				UUID:      service.ID(),
 				ShardID:   1,
 				ReplicaID: 1,
 			},
 			InitialMembers: map[uint64]string{1: service.ID()},
 		},
 	}
-	service.handleCommands([]pb.ScheduleCommand{cmd})
+	service.handleCommands(context.Background(), []pb.ScheduleCommand{cmd})
 
 	ccfg := ClientConfig{
 		LogShardID:       1,

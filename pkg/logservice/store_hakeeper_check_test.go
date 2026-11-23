@@ -49,6 +49,29 @@ func TestIDAllocatorDefaultState(t *testing.T) {
 	assert.Equal(t, uint64(0), v)
 }
 
+func TestLogStoreTimeoutPolicyReady(t *testing.T) {
+	s := &store{}
+	cfg := s.cfg.GetHAKeeperConfig()
+	cfg.Fill()
+	for _, tc := range []struct {
+		name  string
+		term  uint64
+		state pb.CheckerState
+		want  bool
+	}{
+		{name: "not committed", term: 2, want: true},
+		{name: "previous leader, same timeout", term: 2, state: pb.CheckerState{LogStoreTimeoutPolicyTerm: 1, LogStoreTimeoutPolicyTicks: cfg.LogStoreTimeoutTicks()}, want: true},
+		{name: "future term", term: 1, state: pb.CheckerState{LogStoreTimeoutPolicyTerm: 2, LogStoreTimeoutPolicyTicks: cfg.LogStoreTimeoutTicks()}},
+		{name: "previous leader, different timeout", term: 2, state: pb.CheckerState{LogStoreTimeoutPolicyTerm: 1, LogStoreTimeoutPolicyTicks: cfg.LogStoreTimeoutTicks() + 1}},
+		{name: "different timeout", term: 2, state: pb.CheckerState{LogStoreTimeoutPolicyTerm: 2, LogStoreTimeoutPolicyTicks: cfg.LogStoreTimeoutTicks() + 1}},
+		{name: "current", term: 2, state: pb.CheckerState{LogStoreTimeoutPolicyTerm: 2, LogStoreTimeoutPolicyTicks: cfg.LogStoreTimeoutTicks()}, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, s.logStoreTimeoutPolicyReady(&tc.state, tc.term))
+		})
+	}
+}
+
 func TestNextHAKeeperCheckIntervalUsesFastBootstrapInterval(t *testing.T) {
 	s := &store{
 		cfg: Config{
@@ -734,6 +757,32 @@ func TestHAKeeperCanBootstrapAndRepairShards(t *testing.T) {
 		_, err = services[0].store.addTNStoreHeartbeat(ctx, tnMsg2)
 		require.NoError(t, err)
 
+		initial, err := leaderStore.nh.SyncGetShardMembership(ctx, hakeeper.DefaultHAKeeperShardID)
+		require.NoError(t, err)
+		require.Equal(t, map[uint64]string{1: services[0].ID(), 2: services[1].ID(), 3: services[2].ID()}, initial.Nodes)
+		var removedIndex, addedIndex uint64
+		var repaired *dragonboat.Membership
+		observeChange := func(s *Service, batch pb.CommandBatch) {
+			s.handleCommands(context.Background(), batch.Commands)
+			for _, cmd := range batch.Commands {
+				if !isMembershipChange(cmd.ConfigChange) || cmd.ConfigChange.Replica.ShardID != hakeeper.DefaultHAKeeperShardID {
+					continue
+				}
+				readCtx, stop := context.WithTimeout(context.Background(), time.Second)
+				membership, readErr := s.store.nh.SyncGetShardMembership(readCtx, hakeeper.DefaultHAKeeperShardID)
+				stop()
+				if readErr != nil {
+					continue
+				}
+				if len(membership.Nodes) == 2 && membership.Nodes[2] == initial.Nodes[2] && membership.Nodes[3] == initial.Nodes[3] {
+					removedIndex = membership.ConfigChangeID
+				}
+				if len(membership.Nodes) == 3 && membership.Nodes[1] == "" && membership.Nodes[2] == initial.Nodes[2] && membership.Nodes[3] == initial.Nodes[3] {
+					addedIndex, repaired = membership.ConfigChangeID, membership
+				}
+			}
+		}
+
 		// stop store 1
 		require.NoError(t, services[0].Close())
 		// no service.Close can be repeatedly called
@@ -751,19 +800,19 @@ func TestHAKeeperCanBootstrapAndRepairShards(t *testing.T) {
 				if cb, err := services[0].store.addLogStoreHeartbeat(ctx, m); err != nil {
 					return false, err
 				} else {
-					services[0].handleCommands(cb.Commands)
+					observeChange(services[0], cb)
 				}
 				m = services[1].store.getHeartbeatMessage()
 				if cb, err := services[1].store.addLogStoreHeartbeat(ctx, m); err != nil {
 					return false, err
 				} else {
-					services[1].handleCommands(cb.Commands)
+					observeChange(services[1], cb)
 				}
 				m = services[2].store.getHeartbeatMessage()
 				if cb, err := services[0].store.addLogStoreHeartbeat(ctx, m); err != nil {
 					return false, err
 				} else {
-					services[2].handleCommands(cb.Commands)
+					observeChange(services[2], cb)
 				}
 				if _, err := services[0].store.addTNStoreHeartbeat(ctx, tnMsg2); err != nil {
 					return false, err
@@ -811,6 +860,28 @@ func TestHAKeeperCanBootstrapAndRepairShards(t *testing.T) {
 				t.Fatalf("unexpected error %v", err)
 			}
 			if completed {
+				require.Greater(t, removedIndex, initial.ConfigChangeID, "removal must commit at a newer index")
+				require.Greater(t, addedIndex, removedIndex, "replacement must commit after removal")
+				require.NotNil(t, repaired)
+				require.Contains(t, repaired.Nodes, uint64(2))
+				require.Contains(t, repaired.Nodes, uint64(3))
+				require.NotContains(t, repaired.Nodes, uint64(1))
+				var replacementID uint64
+				for id, store := range repaired.Nodes {
+					if store == services[2].ID() {
+						replacementID = id
+					}
+				}
+				require.NotZero(t, replacementID, "the spare must be a new configured voter")
+				// The spare and one retained voter must form a working quorum.
+				require.NoError(t, services[1].Close())
+				services[1].store = nil
+				require.Eventually(t, func() bool {
+					writeCtx, stop := context.WithTimeout(context.Background(), 500*time.Millisecond)
+					defer stop()
+					_, writeErr := services[0].store.addLogStoreHeartbeat(writeCtx, services[0].store.getHeartbeatMessage())
+					return writeErr == nil
+				}, 10*time.Second, 50*time.Millisecond, "a new quorum must commit a heartbeat")
 				for _, s := range services[:3] {
 					_ = s.task.holder.Close()
 				}
@@ -1388,7 +1459,7 @@ func TestTaskSchedulerCanReScheduleExpiredTasks(t *testing.T) {
 			// Propose through Raft, with errors visible to the test, instead of
 			// waiting for a wall-clock worker to advance the logical clock.
 			session := store.nh.GetNoOPSession(hakeeper.DefaultHAKeeperShardID)
-			_, err := store.propose(ctx, session, hakeeper.GetTickCmd())
+			_, err := store.propose(ctx, session, hakeeper.GetTickCmd(testHAKeeperTerm(t, store), store.cfg.GetHAKeeperConfig().LogStoreTimeoutTicks()))
 			require.NoError(t, err)
 		}
 		store.taskSchedule(checkerState()) // Register the task-table user.

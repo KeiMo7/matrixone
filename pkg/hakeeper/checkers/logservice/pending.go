@@ -15,6 +15,8 @@
 package logservice
 
 import (
+	"slices"
+
 	"github.com/matrixorigin/matrixone/pkg/hakeeper"
 	"github.com/matrixorigin/matrixone/pkg/hakeeper/operator"
 	pb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
@@ -24,7 +26,8 @@ import (
 // legacy replacement batch. Reuse current checker candidates: unfinished alone
 // does not mean that an old configuration or storage incarnation is still valid.
 func PendingOperators(fields hakeeper.CheckerCommonFields, state pb.LogState,
-	nonVotingReplicaNum uint64, ops []*operator.Operator) []*operator.Operator {
+	executing, executingNonVoting operator.ExecutingReplicas,
+	nonVotingReplicaNum uint64, ops, newOps []*operator.Operator) []*operator.Operator {
 	working, expired := parseLogStores(fields.Cfg, state, fields.CurrentTick)
 	normal, nonVoting := parseLogShards(fields.Cluster, state, expired, nonVotingReplicaNum)
 	starts := [2]map[operator.Replica]bool{}
@@ -48,23 +51,51 @@ func PendingOperators(fields hakeeper.CheckerCommonFields, state pb.LogState,
 		bootstrap[shard.ShardID] = shard.NumberOfReplicas > 0 && uint64(normal.toAdd[shard.ShardID]) == shard.NumberOfReplicas
 	}
 	live := func(uuid string) bool { _, ok := working[uuid]; return ok }
-	currentEpoch := func(r operator.Replica) bool {
-		shard, ok := state.Shards[r.ShardID]
-		return ok && shard.Epoch == r.Epoch
+	eligible := func(r operator.Replica, target string, change pb.ConfigChangeType) bool {
+		replica := pb.Replica{UUID: r.UUID, ShardID: r.ShardID, ReplicaID: r.ReplicaID, Epoch: r.Epoch}
+		return slices.Contains(hakeeper.LogMembershipTargets(fields.Cfg, state, fields.CurrentTick, change, replica), target)
 	}
-	add := func(role int, r operator.Replica, target string) bool {
-		if additions[role][r.ShardID] == 0 || !currentEpoch(r) || !live(r.UUID) || !live(target) {
+	add := func(role int, r operator.Replica, target string, change pb.ConfigChangeType) bool {
+		if additions[role][r.ShardID] == 0 || !live(r.UUID) || !live(target) {
 			return false
 		}
-		additions[role][r.ShardID]--
+		if !eligible(r, target, change) {
+			return false
+		}
 		return true
 	}
-	remove := func(role int, r operator.Replica, target string) bool {
+	remove := func(role int, r operator.Replica, target string, change pb.ConfigChangeType) bool {
 		key := r
 		key.Epoch = 0
-		return removes[role][key] && currentEpoch(r) && live(target)
+		return !replicaIsStarting(executing, executingNonVoting, r.ShardID, r.ReplicaID) &&
+			removes[role][key] && live(target) && eligible(r, target, change)
 	}
 	var pending []*operator.Operator
+	startsByOperator := make(map[*operator.Operator]operator.Replica)
+	removing := make(map[operator.Replica]bool)
+	selected := make(map[uint64]bool)
+	recordRemoval := func(replica operator.Replica) {
+		if shard, ok := state.Shards[replica.ShardID]; !ok || shard.Epoch <= replica.Epoch {
+			removing[operator.Replica{ShardID: replica.ShardID, ReplicaID: replica.ReplicaID}] = true
+		}
+	}
+	for _, op := range newOps {
+		if op == nil || op.IsEnd() || len(op.OpSteps()) == 0 {
+			continue
+		}
+		// New Log operators have not been dispatched, so their first step is
+		// the selected command. TN retry operators are ignored here.
+		switch step := op.OpSteps()[0].(type) {
+		case operator.AddLogService, operator.AddNonVotingLogService:
+			selected[op.ShardID()] = true
+		case operator.RemoveLogService:
+			selected[step.ShardID] = true
+			recordRemoval(step.Replica)
+		case operator.RemoveNonVotingLogService:
+			selected[step.ShardID] = true
+			recordRemoval(step.Replica)
+		}
+	}
 	seen := make(map[*operator.Operator]bool, len(ops))
 	for _, op := range ops {
 		if op == nil || seen[op] {
@@ -88,27 +119,53 @@ func PendingOperators(fields hakeeper.CheckerCommonFields, state pb.LogState,
 		if step == nil || op.IsEnd() {
 			continue
 		}
+		var shardID uint64
+		var membership bool
+		switch step := step.(type) {
+		case operator.AddLogService:
+			shardID, membership = step.ShardID, true
+		case operator.AddNonVotingLogService:
+			shardID, membership = step.ShardID, true
+		case operator.RemoveLogService:
+			shardID, membership = step.ShardID, true
+			recordRemoval(step.Replica)
+		case operator.RemoveNonVotingLogService:
+			shardID, membership = step.ShardID, true
+			recordRemoval(step.Replica)
+		}
+		if membership && selected[shardID] {
+			continue
+		}
 		eligible := false
 		switch step := step.(type) {
 		case operator.StartLogService:
 			eligible = live(step.UUID) && starts[0][step.Replica]
+			startsByOperator[op] = step.Replica
 		case operator.StartNonVotingLogService:
 			eligible = live(step.UUID) && starts[1][step.Replica]
+			startsByOperator[op] = step.Replica
 		case operator.AddLogService:
-			eligible = add(0, step.Replica, step.Target)
+			eligible = add(0, step.Replica, step.Target, pb.AddReplica)
 		case operator.AddNonVotingLogService:
-			eligible = add(1, step.Replica, step.Target)
+			eligible = add(1, step.Replica, step.Target, pb.AddNonVotingReplica)
 		case operator.RemoveLogService:
-			eligible = remove(0, step.Replica, step.Target)
+			eligible = remove(0, step.Replica, step.Target, pb.RemoveReplica)
 		case operator.RemoveNonVotingLogService:
-			eligible = remove(1, step.Replica, step.Target)
+			eligible = remove(1, step.Replica, step.Target, pb.RemoveNonVotingReplica)
 		case operator.BootstrapShard:
 			key := operator.Replica{UUID: step.UUID, ShardID: step.ShardID, ReplicaID: step.ReplicaID}
 			eligible = live(step.UUID) && (bootstrap[step.ShardID] || starts[0][key])
+			startsByOperator[op] = key
 		}
 		if eligible {
+			if membership {
+				selected[shardID] = true
+			}
 			pending = append(pending, op)
 		}
 	}
-	return pending
+	return slices.DeleteFunc(pending, func(op *operator.Operator) bool {
+		replica, isStart := startsByOperator[op]
+		return isStart && removing[operator.Replica{ShardID: replica.ShardID, ReplicaID: replica.ReplicaID}]
+	})
 }

@@ -76,7 +76,12 @@ func (cfg *Config) Fill() {
 }
 
 func (cfg Config) LogStoreExpired(start, current uint64) bool {
-	return uint64(int(cfg.LogStoreTimeout/time.Second)*cfg.TickPerSecond)+start < current
+	return cfg.LogStoreTimeoutTicks()+start < current
+}
+
+// LogStoreTimeoutTicks returns the reporting expiration horizon in HAKeeper ticks.
+func (cfg Config) LogStoreTimeoutTicks() uint64 {
+	return uint64(int(cfg.LogStoreTimeout/time.Second) * cfg.TickPerSecond)
 }
 
 func (cfg Config) TNStoreExpired(start, current uint64) bool {

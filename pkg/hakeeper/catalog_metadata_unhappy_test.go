@@ -34,11 +34,13 @@ func unhappyReject(t *testing.T, s *stateMachine, r pb.CatalogMetadataRequest, s
 	require.True(t, proto.Equal(before, s.state.CatalogMetadataBarrier), "拒绝请求改变了 durable barrier")
 }
 
+// These catalog arbitration fixtures use a single voter and exercise the
+// reservation owner independently of quorum-based delivery admission.
 func unhappyHeartbeat(t *testing.T, s *stateMachine, hb pb.LogStoreHeartbeat) pb.CommandBatch {
 	t.Helper()
 	data, err := hb.Marshal()
 	require.NoError(t, err)
-	result, err := s.Update(sm.Entry{Index: s.state.Index + 1, Cmd: GetLogStoreHeartbeatCmd(data)})
+	result, err := s.Update(sm.Entry{Index: s.state.Index + 1, Cmd: getHeartbeatCmd(data, pb.LogHeartbeatUpdate)})
 	require.NoError(t, err)
 	var batch pb.CommandBatch
 	require.NoError(t, batch.Unmarshal(result.Data))

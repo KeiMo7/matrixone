@@ -26,6 +26,19 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+func TestStartWaitsForReportedLocalShard(t *testing.T) {
+	replicas := map[uint64]string{4: "store"}
+	stores := map[string]pb.LogStoreInfo{
+		"store": {Replicas: []pb.LogReplicaInfo{{
+			LogShardInfo: pb.LogShardInfo{ShardID: 1}, ReplicaID: 3, IsNonVoting: true,
+		}}},
+	}
+	assert.Empty(t, getReplicasToStart(1, replicas, nil, stores), "a different local ID still occupies the shard")
+	assert.Len(t, getReplicasToStart(2, replicas, nil, stores), 1, "other shards must be independent")
+	stores["store"] = pb.LogStoreInfo{}
+	assert.Equal(t, []replica{{uuid: "store", shardID: 1, replicaID: 4}}, getReplicasToStart(1, replicas, nil, stores))
+}
+
 func TestParseLogShardsFencesChangedStoreIncarnation(t *testing.T) {
 	cluster := pb.ClusterInfo{LogShards: []metadata.LogShardRecord{{
 		ShardID:          1,
@@ -247,7 +260,7 @@ func TestFixedLogShardInfo(t *testing.T) {
 
 	for i, c := range cases {
 		fmt.Printf("case %v: %s\n", i, c.desc)
-		normal, nonVoting := fixedLogShardInfo(c.record, c.nonVotingReplicaNum, c.info, c.expiredStores)
+		normal, nonVoting := fixedLogShardInfo(c.record, c.nonVotingReplicaNum, c.info, c.expiredStores, nil)
 		assert.Equal(t, c.expectedNormal, normal)
 		assert.Equal(t, c.expectedNonVoting, nonVoting)
 	}
@@ -1088,6 +1101,29 @@ func TestCollectStats(t *testing.T) {
 
 	for i, c := range cases {
 		fmt.Printf("case %v: %s\n", i, c.desc)
+		// Older fixtures omitted replica IDs and roles from healthy reports.
+		// Populate them from this case's configured members; unmatched reports
+		// retain their zombie identity and remain part of the original oracle.
+		for uuid, store := range c.infos.Stores {
+			for i := range store.Replicas {
+				r := &store.Replicas[i]
+				shard := c.infos.Shards[r.ShardID]
+				if r.ReplicaID == 0 {
+					for id, member := range shard.Replicas {
+						if member == uuid {
+							r.ReplicaID = id
+						}
+					}
+					for id, member := range shard.NonVotingReplicas {
+						if member == uuid {
+							r.ReplicaID = id
+						}
+					}
+				}
+				r.IsNonVoting = shard.NonVotingReplicas[r.ReplicaID] == uuid
+			}
+			c.infos.Stores[uuid] = store
+		}
 		normal, nonVoting := parseLogShards(c.cluster, c.infos, c.expired, c.nonVotingReplicaNum)
 		assert.Equal(t, c.expectedNormal, normal)
 		assert.Equal(t, c.expectedNonVoting, nonVoting)

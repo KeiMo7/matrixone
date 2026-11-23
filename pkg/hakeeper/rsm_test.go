@@ -30,6 +30,8 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/pb/metadata"
 )
 
+const testLogStoreTimeoutTicks = uint64(DefaultLogStoreTimeout/time.Second) * DefaultTickPerSecond
+
 func TestHAKeeperStateMachineCanBeCreated(t *testing.T) {
 	defer func() {
 		if r := recover(); r == nil {
@@ -79,7 +81,7 @@ func TestHAKeeperCanBeClosed(t *testing.T) {
 func TestHAKeeperTick(t *testing.T) {
 	tsm1 := NewStateMachine(0, 1).(*stateMachine)
 	assert.Equal(t, uint64(0), tsm1.state.Tick)
-	cmd := GetTickCmd()
+	cmd := GetTickCmd(1, testLogStoreTimeoutTicks)
 	_, err := tsm1.Update(sm.Entry{Cmd: cmd})
 	assert.NoError(t, err)
 	_, err = tsm1.Update(sm.Entry{Cmd: cmd})
@@ -89,7 +91,7 @@ func TestHAKeeperTick(t *testing.T) {
 
 func TestHandleLogHeartbeat(t *testing.T) {
 	tsm1 := NewStateMachine(0, 1).(*stateMachine)
-	cmd := GetTickCmd()
+	cmd := GetTickCmd(1, testLogStoreTimeoutTicks)
 	_, err := tsm1.Update(sm.Entry{Cmd: cmd})
 	assert.NoError(t, err)
 	_, err = tsm1.Update(sm.Entry{Cmd: cmd})
@@ -148,7 +150,7 @@ func TestHandleLogHeartbeat(t *testing.T) {
 
 func TestHandleTNHeartbeat(t *testing.T) {
 	tsm1 := NewStateMachine(0, 1).(*stateMachine)
-	cmd := GetTickCmd()
+	cmd := GetTickCmd(1, testLogStoreTimeoutTicks)
 	_, err := tsm1.Update(sm.Entry{Cmd: cmd})
 	assert.NoError(t, err)
 	_, err = tsm1.Update(sm.Entry{Cmd: cmd})
@@ -180,7 +182,7 @@ func TestHandleTNHeartbeat(t *testing.T) {
 
 func TestHandleCNHeartbeat(t *testing.T) {
 	tsm1 := NewStateMachine(0, 1).(*stateMachine)
-	cmd := GetTickCmd()
+	cmd := GetTickCmd(1, testLogStoreTimeoutTicks)
 	_, err := tsm1.Update(sm.Entry{Cmd: cmd})
 	assert.NoError(t, err)
 	_, err = tsm1.Update(sm.Entry{Cmd: cmd})
@@ -1094,7 +1096,7 @@ func TestTickAssignsIDsToLegacyScheduleCommandBatchesOnce(t *testing.T) {
 		Commands: []pb.ScheduleCommand{command},
 	}
 
-	_, err := rsm.Update(sm.Entry{Index: 41, Cmd: GetTickCmd()})
+	_, err := rsm.Update(sm.Entry{Index: 41, Cmd: GetTickCmd(1, testLogStoreTimeoutTicks)})
 	require.NoError(t, err)
 	assigned := rsm.state.ScheduleCommands[command.UUID]
 	require.Equal(t, uint64(41), assigned.BatchID)
@@ -1102,7 +1104,7 @@ func TestTickAssignsIDsToLegacyScheduleCommandBatchesOnce(t *testing.T) {
 	require.True(t, rsm.state.CommandDeliveryBatchIDsAssigned)
 	require.True(t, rsm.state.CommandDeliveryCommandIDsAssigned)
 
-	_, err = rsm.Update(sm.Entry{Index: 42, Cmd: GetTickCmd()})
+	_, err = rsm.Update(sm.Entry{Index: 42, Cmd: GetTickCmd(1, testLogStoreTimeoutTicks)})
 	require.NoError(t, err)
 	require.Equal(t, uint64(41), rsm.state.ScheduleCommands[command.UUID].BatchID,
 		"subsequent ticks must not rewrite a stable delivery generation")
@@ -1126,7 +1128,7 @@ func TestTickAssignsCommandIDsFromBatchOnlySnapshot(t *testing.T) {
 	require.True(t, rsm.state.CommandDeliveryBatchIDsAssigned)
 	require.False(t, rsm.state.CommandDeliveryCommandIDsAssigned)
 
-	_, err = rsm.Update(sm.Entry{Index: 41, Cmd: GetTickCmd()})
+	_, err = rsm.Update(sm.Entry{Index: 41, Cmd: GetTickCmd(1, testLogStoreTimeoutTicks)})
 	require.NoError(t, err)
 	batch := rsm.state.ScheduleCommands[command.UUID]
 	require.Equal(t, uint64(7), batch.BatchID,
@@ -1449,9 +1451,23 @@ func TestHAKeeperAdmissionWaitsForCapableTarget(t *testing.T) {
 		} {
 			t.Run(transition.name+"/"+changeType.String(), func(t *testing.T) {
 				rsm := NewStateMachine(0, 1).(*stateMachine)
+				rsm.state.LogStoreTimeoutPolicyTerm = 1
+				rsm.state.LogStoreTimeoutPolicyTicks = testLogStoreTimeoutTicks
 				rsm.state.CommandDeliveryPreparing = transition.preparing
 				rsm.state.CommandDeliveryEnabled = transition.enabled
 				rsm.state.LogState.Stores["legacy"] = pb.LogStoreInfo{}
+				shard := pb.LogShardInfo{ShardID: DefaultHAKeeperShardID, Epoch: 1}
+				if changeType == pb.AddReplica || changeType == pb.AddNonVotingReplica {
+					shard.Replicas = map[uint64]string{1: "log-1", 2: "log-2"}
+					for id, uuid := range shard.Replicas {
+						rsm.state.LogState.Stores[uuid] = pb.LogStoreInfo{Replicas: []pb.LogReplicaInfo{{LogShardInfo: shard, ReplicaID: id}}}
+					}
+				} else if changeType == pb.StartReplica {
+					shard.Replicas = map[uint64]string{9: "legacy"}
+				} else if changeType == pb.StartNonVotingReplica {
+					shard.NonVotingReplicas = map[uint64]string{9: "legacy"}
+				}
+				rsm.state.LogState.Shards[DefaultHAKeeperShardID] = shard
 
 				commandUUID := "log-1"
 				if changeType == pb.StartReplica || changeType == pb.StartNonVotingReplica {
@@ -1463,8 +1479,10 @@ func TestHAKeeperAdmissionWaitsForCapableTarget(t *testing.T) {
 					ConfigChange: &pb.ConfigChange{
 						ChangeType: changeType,
 						Replica: pb.Replica{
-							UUID:    "legacy",
-							ShardID: DefaultHAKeeperShardID,
+							UUID:      "legacy",
+							ShardID:   DefaultHAKeeperShardID,
+							ReplicaID: 9,
+							Epoch:     shard.Epoch,
 						},
 					},
 				}
@@ -1483,10 +1501,14 @@ func TestHAKeeperAdmissionWaitsForCapableTarget(t *testing.T) {
 
 				heartbeat := func(index uint64, uuid string, supported bool) sm.Result {
 					t.Helper()
-					data, err := (&pb.LogStoreHeartbeat{
+					hb := pb.LogStoreHeartbeat{
 						UUID:                     uuid,
 						CommandDeliverySupported: supported,
-					}).Marshal()
+					}
+					if uuid == "log-1" && len(shard.Replicas) == 2 {
+						hb.Replicas = []pb.LogReplicaInfo{{LogShardInfo: shard, ReplicaID: 1}}
+					}
+					data, err := hb.Marshal()
 					require.NoError(t, err)
 					result, err := rsm.Update(sm.Entry{
 						Index: index,
@@ -2206,7 +2228,7 @@ func TestHandleUpdateCNLabel(t *testing.T) {
 	s := tsm1.state.CNState
 	assert.Equal(t, 0, len(s.Stores))
 
-	cmd = GetTickCmd()
+	cmd = GetTickCmd(1, testLogStoreTimeoutTicks)
 	_, err = tsm1.Update(sm.Entry{Cmd: cmd})
 	assert.NoError(t, err)
 
@@ -2278,7 +2300,7 @@ func TestHandleUpdateCNWorkState(t *testing.T) {
 	s := tsm1.state.CNState
 	assert.Equal(t, 0, len(s.Stores))
 
-	cmd = GetTickCmd()
+	cmd = GetTickCmd(1, testLogStoreTimeoutTicks)
 	_, err = tsm1.Update(sm.Entry{Cmd: cmd})
 	assert.NoError(t, err)
 
@@ -2354,7 +2376,7 @@ func TestHandlePatchCNStore(t *testing.T) {
 	s := tsm1.state.CNState
 	assert.Equal(t, 0, len(s.Stores))
 
-	cmd = GetTickCmd()
+	cmd = GetTickCmd(1, testLogStoreTimeoutTicks)
 	_, err = tsm1.Update(sm.Entry{Cmd: cmd})
 	assert.NoError(t, err)
 
@@ -2449,7 +2471,7 @@ func TestHandleDeleteCNStore(t *testing.T) {
 	uuid := "uuid1"
 	tsm1 := NewStateMachine(0, 1).(*stateMachine)
 
-	cmd := GetTickCmd()
+	cmd := GetTickCmd(1, testLogStoreTimeoutTicks)
 	_, err := tsm1.Update(sm.Entry{Cmd: cmd})
 	assert.NoError(t, err)
 
@@ -2476,7 +2498,7 @@ func TestHandleDeleteCNStore(t *testing.T) {
 
 func TestHandleProxyHeartbeat(t *testing.T) {
 	tsm1 := NewStateMachine(0, 1).(*stateMachine)
-	cmd := GetTickCmd()
+	cmd := GetTickCmd(1, testLogStoreTimeoutTicks)
 	_, err := tsm1.Update(sm.Entry{Cmd: cmd})
 	assert.NoError(t, err)
 	_, err = tsm1.Update(sm.Entry{Cmd: cmd})

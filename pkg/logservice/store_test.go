@@ -743,7 +743,7 @@ func TestAddScheduleCommands(t *testing.T) {
 			},
 		}
 		require.NoError(t,
-			store.addScheduleCommands(ctx, 1, []pb.ScheduleCommand{sc1, sc2, sc3}))
+			store.addScheduleCommands(ctx, testHAKeeperTerm(t, store), []pb.ScheduleCommand{sc1, sc2, sc3}))
 		cb, err := store.getCommandBatch(ctx, "uuid1")
 		require.NoError(t, err)
 		assert.Equal(t, []pb.ScheduleCommand{sc1, sc3}, cb.Commands)
@@ -1015,6 +1015,8 @@ func TestStopReplicaCanResetHAKeeperReplicaID(t *testing.T) {
 		peers[1] = store.id()
 		assert.NoError(t, store.startHAKeeperReplica(1, peers, false))
 		assert.Equal(t, uint64(1), atomic.LoadUint64(&store.haKeeperReplicaID))
+		assert.Error(t, store.stopReplica(hakeeper.DefaultHAKeeperShardID, 2))
+		assert.Equal(t, uint64(1), atomic.LoadUint64(&store.haKeeperReplicaID), "a failed stop must preserve the live identity")
 		assert.NoError(t, store.stopReplica(hakeeper.DefaultHAKeeperShardID, 1))
 		assert.Equal(t, uint64(0), atomic.LoadUint64(&store.haKeeperReplicaID))
 	}

@@ -326,6 +326,18 @@ func (l *store) bootstrapStatusLogAllowed() bool {
 	return true
 }
 
+func (l *store) logStoreTimeoutPolicyReady(state *pb.CheckerState, term uint64) bool {
+	if term == 0 || state.LogStoreTimeoutPolicyTerm > term {
+		return false
+	}
+	if state.LogStoreTimeoutPolicyTerm == 0 {
+		return true
+	}
+	cfg := l.cfg.GetHAKeeperConfig()
+	cfg.Fill()
+	return state.LogStoreTimeoutPolicyTicks == cfg.LogStoreTimeoutTicks()
+}
+
 func (l *store) hakeeperCheck() *pb.CheckerState {
 	state, term := l.getCheckerStateFromLeader()
 	if state == nil {
@@ -358,6 +370,11 @@ func (l *store) hakeeperCheck() *pb.CheckerState {
 		}
 	}
 	cancel()
+	// After policy activation, a new leader with a different timeout must first
+	// publish it before scheduling against the delivery policy.
+	if !l.logStoreTimeoutPolicyReady(state, term) {
+		return state
+	}
 
 	switch state.State {
 	case pb.HAKeeperBootstrapping:

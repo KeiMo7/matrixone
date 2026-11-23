@@ -738,13 +738,11 @@ func (l *store) stopReplica(shardID uint64, replicaID uint64) error {
 }
 
 func (l *store) stopReplicaRaw(shardID uint64, replicaID uint64) error {
-	if shardID == hakeeper.DefaultHAKeeperShardID {
-		defer func() {
-			atomic.StoreUint64(&l.haKeeperReplicaID, 0)
-		}()
-	}
 	if err := l.nh.StopReplica(shardID, replicaID); err != nil {
 		return err
+	}
+	if shardID == hakeeper.DefaultHAKeeperShardID {
+		atomic.CompareAndSwapUint64(&l.haKeeperReplicaID, replicaID, 0)
 	}
 	if l.onReplicaChanged != nil {
 		l.onReplicaChanged(shardID, replicaID, DelReplica)
@@ -2018,14 +2016,16 @@ func (l *store) waitHAKeeperLeaderReady(ctx context.Context, maxWait time.Durati
 
 // TODO: add test for this
 func (l *store) hakeeperTick() {
-	isLeader, _, err := l.isLeaderHAKeeper()
+	isLeader, term, err := l.isLeaderHAKeeper()
 	if err != nil {
 		l.runtime.Logger().Error("failed to get HAKeeper Leader ID", zap.Error(err))
 		return
 	}
 
 	if isLeader {
-		cmd := hakeeper.GetTickCmd()
+		cfg := l.cfg.GetHAKeeperConfig()
+		cfg.Fill()
+		cmd := hakeeper.GetTickCmd(term, cfg.LogStoreTimeoutTicks())
 		ctx, cancel := context.WithTimeoutCause(context.Background(), hakeeperDefaultTimeout, moerr.CauseHakeeperTick)
 		defer cancel()
 		session := l.nh.GetNoOPSession(hakeeper.DefaultHAKeeperShardID)

@@ -394,14 +394,16 @@ func GetTaskTableUserCmd(user pb.TaskTableUser) []byte {
 	return cmd
 }
 
-func GetTickCmd() []byte {
-	cmd := make([]byte, headerSize)
+func GetTickCmd(term, timeoutTicks uint64) []byte {
+	cmd := make([]byte, headerSize+16)
 	binaryEnc.PutUint32(cmd, uint32(pb.TickUpdate))
+	binaryEnc.PutUint64(cmd[headerSize:], term)
+	binaryEnc.PutUint64(cmd[headerSize+8:], timeoutTicks)
 	return cmd
 }
 
 func GetLogStoreHeartbeatCmd(data []byte) []byte {
-	return getHeartbeatCmd(data, pb.LogHeartbeatUpdate)
+	return getHeartbeatCmd(data, pb.GuardedLogHeartbeatUpdate)
 }
 
 func GetCNStoreHeartbeatCmd(data []byte) []byte {
@@ -519,7 +521,7 @@ func (s *stateMachine) handleUpdateCommandsCmd(cmd []byte) sm.Result {
 	if err := b.Unmarshal(data); err != nil {
 		panic(err)
 	}
-	if s.state.Term > b.Term {
+	if s.state.Term > b.Term || s.state.LogStoreTimeoutPolicyTerm > b.Term {
 		return sm.Result{}
 	}
 	if s.state.LogServiceRecoveryPending && !s.state.LogServiceRecoveryPrepared {
@@ -788,12 +790,13 @@ func coalescibleReplicaChange(serviceType pb.ServiceType, change *pb.ConfigChang
 }
 
 func (s *stateMachine) getCommandBatch(uuid string) sm.Result {
-	return s.getCommandBatchFiltered(uuid, false)
+	return s.getCommandBatchFiltered(uuid, nil, false)
 }
 
 func (s *stateMachine) getCommandBatchFiltered(
 	uuid string,
-	filterHAKeeperAdmissions bool,
+	hb *pb.LogStoreHeartbeat,
+	guarded bool,
 ) sm.Result {
 	if batch, ok := s.state.ScheduleCommands[uuid]; ok {
 		deliver := make([]pb.ScheduleCommand, 0, len(batch.Commands))
@@ -811,16 +814,24 @@ func (s *stateMachine) getCommandBatchFiltered(
 			if applied {
 				continue
 			}
-			if (filterHAKeeperAdmissions && !s.logScheduleCommandDeliverable(cmd)) || !s.prepareCatalogSchedule(&cmd) {
+			mustWait := hb != nil && !s.logScheduleCommandDeliverable(cmd)
+			if !mustWait && guarded && isLogMembershipChange(cmd) {
+				if !s.logMembershipDeliverable(uuid, cmd) {
+					continue
+				}
+			}
+			if mustWait || !s.prepareCatalogSchedule(&cmd) {
 				pending = append(pending, cmd)
 				if pendingIDs != nil {
 					pendingIDs = append(pendingIDs, batch.CommandIDs[i])
 				}
 				continue
 			}
-			deliver = append(deliver, cmd)
-			if deliverIDs != nil {
-				deliverIDs = append(deliverIDs, batch.CommandIDs[i])
+			if hb == nil || s.logStartDeliverable(uuid, hb.StoreIncarnation, cmd) {
+				deliver = append(deliver, cmd)
+				if deliverIDs != nil {
+					deliverIDs = append(deliverIDs, batch.CommandIDs[i])
+				}
 			}
 			if retryable {
 				pending = append(pending, cmd)
@@ -849,6 +860,32 @@ func (s *stateMachine) getCommandBatchFiltered(
 	}
 	return sm.Result{}
 
+}
+
+func isLogMembershipChange(cmd pb.ScheduleCommand) bool {
+	change := cmd.ConfigChange
+	if cmd.ServiceType != pb.LogService || change == nil || cmd.Bootstrapping {
+		return false
+	}
+	switch change.ChangeType {
+	case pb.AddReplica, pb.AddNonVotingReplica, pb.RemoveReplica, pb.RemoveNonVotingReplica:
+		return true
+	default:
+		return false
+	}
+}
+
+// logMembershipDeliverable reuses the scheduler's reporting-quorum rule after
+// this heartbeat updates replicated observations. Before the first policy tick,
+// report withdrawals still apply, but report age cannot yet be evaluated.
+func (s *stateMachine) logMembershipDeliverable(uuid string, cmd pb.ScheduleCommand) bool {
+	if uuid == "" {
+		return false
+	}
+	change := cmd.ConfigChange
+	_, matched := logMembershipTargets(s.state.LogStoreTimeoutPolicyTicks, s.state.LogStoreTimeoutPolicyTerm != 0,
+		s.state.LogState, s.state.Tick, change.ChangeType, change.Replica, uuid)
+	return matched
 }
 
 // hakeeperAdmissionTarget returns the LogStore that a schedule command would
@@ -1093,8 +1130,7 @@ func (s *stateMachine) handleTNHeartbeat(cmd []byte) (result sm.Result) {
 	return s.getCommandBatch(hb.UUID)
 }
 
-func (s *stateMachine) handleLogHeartbeat(cmd []byte) (result sm.Result) {
-	data := parseHeartbeatCmd(cmd)
+func (s *stateMachine) handleLogHeartbeat(data []byte, guarded bool) (result sm.Result) {
 	var hb pb.LogStoreHeartbeat
 	if err := hb.Unmarshal(data); err != nil {
 		panic(err)
@@ -1135,7 +1171,28 @@ func (s *stateMachine) handleLogHeartbeat(cmd []byte) (result sm.Result) {
 			delete(s.state.CommandDeliveryReady, hb.UUID)
 		}
 	}
-	return s.attachPendingCatalogStart(s.getCommandBatchFiltered(hb.UUID, true), hb)
+	return s.attachPendingCatalogStart(s.getCommandBatchFiltered(hb.UUID, &hb, guarded), hb)
+}
+
+// logStartDeliverable filters only the response. Existing queue, bootstrap
+// retry, and catalog permit transitions still run for every command.
+func (s *stateMachine) logStartDeliverable(uuid, incarnation string, command pb.ScheduleCommand) bool {
+	change := command.ConfigChange
+	if command.ServiceType != pb.LogService || change == nil || command.Bootstrapping ||
+		(change.Replica.ShardID == DefaultHAKeeperShardID && command.CatalogMetadataStart != nil) ||
+		(change.ChangeType != pb.StartReplica && change.ChangeType != pb.StartNonVotingReplica) {
+		return true
+	}
+	replica := change.Replica
+	shard, ok := s.state.LogState.Shards[replica.ShardID]
+	members := shard.Replicas
+	if change.ChangeType == pb.StartNonVotingReplica {
+		members = shard.NonVotingReplicas
+	}
+	member, exists := members[replica.ReplicaID]
+	previousIncarnation := shard.ReplicaStoreIncarnations[replica.ReplicaID]
+	return ok && uuid != "" && command.UUID == uuid && replica.UUID == uuid && exists && member == uuid &&
+		(previousIncarnation == "" || previousIncarnation == incarnation)
 }
 
 func (s *stateMachine) handleTick(cmd []byte) sm.Result {
@@ -1672,8 +1729,24 @@ func (s *stateMachine) Update(e sm.Entry) (sm.Result, error) {
 	case pb.CNHeartbeatUpdate:
 		return s.handleCNHeartbeat(cmd), nil
 	case pb.LogHeartbeatUpdate:
-		return s.handleLogHeartbeat(cmd), nil
+		// Released logs used this entry without a delivery-time timeout.
+		return s.handleLogHeartbeat(parseHeartbeatCmd(cmd), false), nil
+	case pb.GuardedLogHeartbeatUpdate:
+		return s.handleLogHeartbeat(parseHeartbeatCmd(cmd), true), nil
 	case pb.TickUpdate:
+		if len(cmd) != headerSize && len(cmd) != headerSize+16 {
+			return sm.Result{}, moerr.NewInvalidInputNoCtx("invalid HAKeeper tick entry")
+		}
+		if len(cmd) > headerSize {
+			term := binaryEnc.Uint64(cmd[headerSize:])
+			if term == 0 {
+				return sm.Result{}, moerr.NewInvalidInputNoCtx("HAKeeper policy tick has zero term")
+			}
+			if term > s.state.LogStoreTimeoutPolicyTerm && term >= s.state.Term {
+				s.state.LogStoreTimeoutPolicyTerm = term
+				s.state.LogStoreTimeoutPolicyTicks = binaryEnc.Uint64(cmd[headerSize+8:])
+			}
+		}
 		return s.handleTick(cmd), nil
 	case pb.GetIDUpdate:
 		if (s.state.LogServiceRecoveryPending && !s.state.LogServiceRecoveryPrepared) ||
@@ -1749,6 +1822,8 @@ func (s *stateMachine) handleStateQuery(scheduling bool) interface{} {
 		IDWatermarkRestoreGeneration: s.state.IDWatermarkRestoreGeneration,
 		LogServiceRecoveryPrepared:   s.state.LogServiceRecoveryPrepared,
 		LogServiceRecoveryCompleted:  s.state.LogServiceRecoveryCompleted,
+		LogStoreTimeoutPolicyTerm:    s.state.LogStoreTimeoutPolicyTerm,
+		LogStoreTimeoutPolicyTicks:   s.state.LogStoreTimeoutPolicyTicks,
 	}
 	if scheduling {
 		// Copy records before projecting: the replicated authority and full

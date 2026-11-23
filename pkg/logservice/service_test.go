@@ -127,6 +127,29 @@ func runServiceTest(t *testing.T,
 	fn(t, service)
 }
 
+func testHAKeeperTerm(t *testing.T, s *store) uint64 {
+	t.Helper()
+	var term uint64
+	require.Eventually(t, func() bool {
+		leader, observed, err := s.isLeaderHAKeeper()
+		if err == nil && leader {
+			term = observed
+			return true
+		}
+		return false
+	}, 3*time.Second, 10*time.Millisecond)
+	return term
+}
+
+func commitTestHAKeeperPolicy(t *testing.T, ctx context.Context, s *store) {
+	t.Helper()
+	cfg := s.cfg.GetHAKeeperConfig()
+	cfg.Fill()
+	session := s.nh.GetNoOPSession(hapkg.DefaultHAKeeperShardID)
+	_, err := s.propose(ctx, session, hapkg.GetTickCmd(testHAKeeperTerm(t, s), cfg.LogStoreTimeoutTicks()))
+	require.NoError(t, err)
+}
+
 func TestNewService(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	var cfg Config
@@ -367,8 +390,9 @@ func getTestAppendCmd(id uint64, data []byte) []byte {
 
 func TestServiceHandleLogHeartbeat(t *testing.T) {
 	fn := func(t *testing.T, s *Service) {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		commitTestHAKeeperPolicy(t, ctx, s.store)
 
 		req := pb.Request{
 			Method: pb.LOG_HEARTBEAT,
@@ -379,6 +403,7 @@ func TestServiceHandleLogHeartbeat(t *testing.T) {
 		sc1 := pb.ScheduleCommand{
 			UUID: "uuid1",
 			ConfigChange: &pb.ConfigChange{
+				ChangeType: pb.StopReplica,
 				Replica: pb.Replica{
 					ShardID: 1,
 				},
@@ -387,6 +412,7 @@ func TestServiceHandleLogHeartbeat(t *testing.T) {
 		sc2 := pb.ScheduleCommand{
 			UUID: "uuid2",
 			ConfigChange: &pb.ConfigChange{
+				ChangeType: pb.StopReplica,
 				Replica: pb.Replica{
 					ShardID: 2,
 				},
@@ -395,13 +421,14 @@ func TestServiceHandleLogHeartbeat(t *testing.T) {
 		sc3 := pb.ScheduleCommand{
 			UUID: "uuid1",
 			ConfigChange: &pb.ConfigChange{
+				ChangeType: pb.StopReplica,
 				Replica: pb.Replica{
 					ShardID: 3,
 				},
 			},
 		}
 		require.NoError(t,
-			s.store.addScheduleCommands(ctx, 1, []pb.ScheduleCommand{sc1, sc2, sc3}))
+			s.store.addScheduleCommands(ctx, testHAKeeperTerm(t, s.store), []pb.ScheduleCommand{sc1, sc2, sc3}))
 		resp := s.handleLogHeartbeat(ctx, req)
 		require.Equal(t, []pb.ScheduleCommand{sc1, sc3}, resp.CommandBatch.Commands)
 		require.Len(t, s.store.hakeeperCheckWakeup, 1)
@@ -410,6 +437,36 @@ func TestServiceHandleLogHeartbeat(t *testing.T) {
 		require.Equal(t, uint32(moerr.Ok), resp.ErrorCode)
 		require.Empty(t, resp.CommandBatch.Commands)
 		require.Empty(t, s.store.hakeeperCheckWakeup)
+
+		// Heartbeat delivery uses the committed timeout and current reports.
+		shard := pb.LogShardInfo{ShardID: 17, Epoch: 7, Replicas: map[uint64]string{1: "a", 2: "b", 3: "c"}}
+		heartbeat := func(uuid string, replica uint64) pb.CommandBatch {
+			t.Helper()
+			hb := pb.LogStoreHeartbeat{UUID: uuid}
+			if replica != 0 {
+				hb.Replicas = []pb.LogReplicaInfo{{LogShardInfo: shard, ReplicaID: replica}}
+			}
+			batch, err := s.store.addLogStoreHeartbeat(ctx, hb)
+			require.NoError(t, err)
+			return batch
+		}
+		heartbeat("a", 1)
+		heartbeat("c", 3)
+		remove := pb.ScheduleCommand{UUID: "a", ServiceType: pb.LogService, ConfigChange: &pb.ConfigChange{
+			ChangeType: pb.RemoveReplica, Replica: pb.Replica{UUID: "b", ShardID: 17, ReplicaID: 2, Epoch: 7},
+		}}
+		require.NoError(t, s.store.addScheduleCommands(ctx, testHAKeeperTerm(t, s.store), []pb.ScheduleCommand{remove}))
+		heartbeat("b", 2)
+		heartbeat("c", 0)
+		require.Empty(t, heartbeat("a", 1).Commands)
+
+		// C's report is one tick old but still valid under the committed timeout.
+		heartbeat("c", 3)
+		session := s.store.nh.GetNoOPSession(hapkg.DefaultHAKeeperShardID)
+		_, err := s.store.propose(ctx, session, hapkg.GetTickCmd(testHAKeeperTerm(t, s.store), s.store.cfg.GetHAKeeperConfig().LogStoreTimeoutTicks()))
+		require.NoError(t, err)
+		require.NoError(t, s.store.addScheduleCommands(ctx, testHAKeeperTerm(t, s.store), []pb.ScheduleCommand{remove}))
+		require.Equal(t, []pb.ScheduleCommand{remove}, heartbeat("a", 1).Commands)
 	}
 	runServiceTest(t, true, true, fn)
 }
@@ -474,7 +531,7 @@ func TestServiceHandleTNHeartbeat(t *testing.T) {
 			},
 		}
 		require.NoError(t,
-			s.store.addScheduleCommands(ctx, 1, []pb.ScheduleCommand{sc1, sc2, sc3}))
+			s.store.addScheduleCommands(ctx, testHAKeeperTerm(t, s.store), []pb.ScheduleCommand{sc1, sc2, sc3}))
 		resp := s.handleTNHeartbeat(ctx, req)
 		require.Equal(t, []pb.ScheduleCommand{sc1, sc3}, resp.CommandBatch.Commands)
 		require.Len(t, s.store.hakeeperCheckWakeup, 1)
@@ -504,7 +561,7 @@ func TestServicePollCommandsIsNonDestructiveAndDeduplicable(t *testing.T) {
 			},
 		}
 		require.NoError(t,
-			s.store.addScheduleCommands(ctx, 1, []pb.ScheduleCommand{command}))
+			s.store.addScheduleCommands(ctx, testHAKeeperTerm(t, s.store), []pb.ScheduleCommand{command}))
 
 		query := pb.Request{
 			Method: pb.GET_SCHEDULE_COMMANDS,
@@ -585,7 +642,7 @@ func TestServiceRejectsInvalidScheduleCommandQueries(t *testing.T) {
 			ServiceType: pb.CNService,
 		}
 		require.NoError(t,
-			s.store.addScheduleCommands(ctx, 1, []pb.ScheduleCommand{command}))
+			s.store.addScheduleCommands(ctx, testHAKeeperTerm(t, s.store), []pb.ScheduleCommand{command}))
 		resp := s.handleGetScheduleCommands(ctx, pb.Request{
 			Method: pb.GET_SCHEDULE_COMMANDS,
 			ScheduleCommandQuery: &pb.ScheduleCommandQuery{
@@ -692,6 +749,7 @@ func TestServiceCommandDeliveryActivationWaitsForPendingHAKeeperAdmission(t *tes
 	fn := func(t *testing.T, s *Service) {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
+		commitTestHAKeeperPolicy(t, ctx, s.store)
 
 		heartbeat := func(uuid string, supported bool) pb.Response {
 			message := pb.LogStoreHeartbeat{
@@ -709,18 +767,24 @@ func TestServiceCommandDeliveryActivationWaitsForPendingHAKeeperAdmission(t *tes
 
 		require.Equal(t, uint32(moerr.Ok), heartbeat(s.store.id(), true).ErrorCode)
 		require.Equal(t, uint32(moerr.Ok), heartbeat("legacy", false).ErrorCode)
+		state, err := s.store.getCheckerStateWithContext(ctx)
+		require.NoError(t, err)
+		shard, ok := state.LogState.Shards[hapkg.DefaultHAKeeperShardID]
+		require.True(t, ok)
 		command := pb.ScheduleCommand{
 			UUID:        s.store.id(),
 			ServiceType: pb.LogService,
 			ConfigChange: &pb.ConfigChange{
-				ChangeType: pb.AddReplica,
+				ChangeType: pb.AddNonVotingReplica,
 				Replica: pb.Replica{
-					UUID:    "legacy",
-					ShardID: hapkg.DefaultHAKeeperShardID,
+					UUID:      "legacy",
+					ShardID:   hapkg.DefaultHAKeeperShardID,
+					ReplicaID: 9,
+					Epoch:     shard.Epoch,
 				},
 			},
 		}
-		require.NoError(t, s.store.addScheduleCommands(ctx, 1, []pb.ScheduleCommand{command}))
+		require.NoError(t, s.store.addScheduleCommands(ctx, testHAKeeperTerm(t, s.store), []pb.ScheduleCommand{command}))
 
 		// The leader-side read prevents even proposing an update tag that the
 		// pending legacy member could later replay.
@@ -930,7 +994,7 @@ func TestServiceViewMetadataAdmissionReconcilesPendingBeforeProtocolRaise(t *tes
 			if state.Tick > oldTargetTick+timeoutTicks {
 				break
 			}
-			propose(hapkg.GetTickCmd())
+			propose(hapkg.GetTickCmd(testHAKeeperTerm(t, s.store), s.store.cfg.GetHAKeeperConfig().LogStoreTimeoutTicks()))
 		}
 		// Keep the replacement live while the old generation's target expires.
 		cnHeartbeat(11, restartEpoch, restartEpoch)

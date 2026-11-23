@@ -1274,15 +1274,24 @@ func TestHAKeeperSnapshotEnvelopeRejectsInvalidPayloadWithoutMutation(t *testing
 
 func TestViewMetadataAdmissionFencesLateHAKeeperMember(t *testing.T) {
 	rsm := NewStateMachine(0, 1).(*stateMachine)
+	rsm.state.LogStoreTimeoutPolicyTerm = 1
+	rsm.state.LogStoreTimeoutPolicyTicks = testLogStoreTimeoutTicks
 	rsm.state.ViewMetadataAdmissionEnabled = true
+	shard := pb.LogShardInfo{ShardID: DefaultHAKeeperShardID, Epoch: 1, Replicas: map[uint64]string{1: "executor", 2: "voter"}}
+	rsm.state.LogState.Shards[DefaultHAKeeperShardID] = shard
+	for id, uuid := range shard.Replicas {
+		rsm.state.LogState.Stores[uuid] = pb.LogStoreInfo{Replicas: []pb.LogReplicaInfo{{LogShardInfo: shard, ReplicaID: id}}}
+	}
 	command := pb.ScheduleCommand{
-		UUID:        "joining-log",
+		UUID:        "executor",
 		ServiceType: pb.LogService,
 		ConfigChange: &pb.ConfigChange{
 			ChangeType: pb.AddReplica,
 			Replica: pb.Replica{
-				UUID:    "joining-log",
-				ShardID: DefaultHAKeeperShardID,
+				UUID:      "joining-log",
+				ShardID:   DefaultHAKeeperShardID,
+				ReplicaID: 9,
+				Epoch:     shard.Epoch,
 			},
 		},
 	}
@@ -1292,13 +1301,17 @@ func TestViewMetadataAdmissionFencesLateHAKeeperMember(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	heartbeat := func(admissionSupported bool) pb.CommandBatch {
+	heartbeat := func(uuid string, admissionSupported bool) pb.CommandBatch {
 		t.Helper()
-		data, marshalErr := (&pb.LogStoreHeartbeat{
-			UUID:                           "joining-log",
+		hb := pb.LogStoreHeartbeat{
+			UUID:                           uuid,
 			CommandDeliverySupported:       true,
 			ViewMetadataAdmissionSupported: admissionSupported,
-		}).Marshal()
+		}
+		if uuid == "executor" {
+			hb.Replicas = []pb.LogReplicaInfo{{LogShardInfo: shard, ReplicaID: 1}}
+		}
+		data, marshalErr := hb.Marshal()
 		require.NoError(t, marshalErr)
 		result, updateErr := rsm.Update(sm.Entry{
 			Index: rsm.state.Index + 1,
@@ -1309,8 +1322,10 @@ func TestViewMetadataAdmissionFencesLateHAKeeperMember(t *testing.T) {
 		require.NoError(t, batch.Unmarshal(result.Data))
 		return batch
 	}
-	require.Empty(t, heartbeat(false).Commands)
-	require.Equal(t, []pb.ScheduleCommand{command}, heartbeat(true).Commands)
+	require.Empty(t, heartbeat("joining-log", false).Commands)
+	require.Empty(t, heartbeat("executor", true).Commands)
+	require.Empty(t, heartbeat("joining-log", true).Commands)
+	require.Equal(t, []pb.ScheduleCommand{command}, heartbeat("executor", true).Commands)
 }
 
 func TestViewMetadataAdmissionReconciliationExpiresAbandonedGeneration(t *testing.T) {

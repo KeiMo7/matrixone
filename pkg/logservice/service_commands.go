@@ -30,41 +30,74 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/util/trace"
 )
 
-func (s *Service) handleCommands(cmds []pb.ScheduleCommand) {
+func (s *Service) handleCommands(ctx context.Context, cmds []pb.ScheduleCommand) {
+	// A stop initiates asynchronous offload. Do not start a new incarnation of
+	// the same shard in this batch; bootstrap and catalog owners retry theirs.
+	var stopping map[uint64]bool
 	for _, cmd := range cmds {
-		s.runtime.Logger().Info(fmt.Sprintf("%s applying cmd: %s", s.ID(), cmd.LogString()))
-		if cmd.GetConfigChange() != nil {
-			if cmd.ConfigChange.Replica.ShardID == hakeeper.DefaultHAKeeperShardID && s.store.catalogExecutor.enabled {
-				if err := s.store.executeCatalogCommand(cmd); err != nil {
+		if change := cmd.GetConfigChange(); isReplicaCleanup(change) {
+			if stopping == nil {
+				stopping = make(map[uint64]bool)
+			}
+			stopping[change.Replica.ShardID] = true
+		}
+	}
+	for _, cmd := range cmds {
+		change := cmd.GetConfigChange()
+		if ctx.Err() != nil && !isReplicaCleanup(change) {
+			continue
+		}
+		if change != nil && isMembershipChange(change) {
+			continue
+		}
+		if change != nil && (change.ChangeType == pb.StartReplica || change.ChangeType == pb.StartNonVotingReplica) {
+			if stopping[change.Replica.ShardID] {
+				s.runtime.Logger().Warn("skipping replica start in the same batch as a stop", zap.String("command", cmd.LogString()))
+				continue
+			}
+			if change.Replica.ShardID == hakeeper.DefaultHAKeeperShardID && s.store.catalogExecutor.enabled {
+				if err := s.store.executeCatalogCommand(ctx, cmd); err != nil {
 					s.runtime.Logger().Error("catalog metadata command rejected", zap.Error(err))
 				}
 				continue
 			}
-			s.runtime.Logger().Debug("applying schedule command:", zap.String("command", cmd.LogString()))
-			switch cmd.ConfigChange.ChangeType {
-			case pb.AddReplica:
-				s.handleAddReplica(cmd)
-			case pb.AddNonVotingReplica:
-				s.handleAddNonVotingReplica(cmd)
-			case pb.RemoveReplica:
-				s.handleRemoveReplica(cmd)
-			case pb.RemoveNonVotingReplica:
-				s.handleRemoveReplica(cmd)
-			case pb.StartReplica:
+			if cmd.UUID != s.ID() || !s.canStartLocalReplica(change.Replica) ||
+				(cmd.Bootstrapping && change.InitialMembers[change.Replica.ReplicaID] != s.ID()) {
+				continue
+			}
+			s.runtime.Logger().Info(fmt.Sprintf("%s applying cmd: %s", s.ID(), cmd.LogString()))
+			if ctx.Err() != nil {
+				continue
+			}
+			if change.ChangeType == pb.StartReplica {
 				s.handleStartReplica(cmd)
-			case pb.StartNonVotingReplica:
+			} else {
 				s.handleStartNonVotingReplica(cmd)
-			case pb.StopReplica:
-				s.handleStopReplica(cmd)
-			case pb.StopNonVotingReplica:
+			}
+			continue
+		}
+		s.runtime.Logger().Info(fmt.Sprintf("%s applying cmd: %s", s.ID(), cmd.LogString()))
+		if ctx.Err() != nil && !isReplicaCleanup(change) {
+			continue
+		}
+		if change != nil {
+			if change.Replica.ShardID == hakeeper.DefaultHAKeeperShardID && s.store.catalogExecutor.enabled {
+				if err := s.store.executeCatalogCommand(ctx, cmd); err != nil {
+					s.runtime.Logger().Error("catalog metadata command rejected", zap.Error(err))
+				}
+				continue
+			}
+			switch change.ChangeType {
+			case pb.StopReplica, pb.StopNonVotingReplica:
 				s.handleStopReplica(cmd)
 			case pb.KillZombie:
 				s.handleKillZombie(cmd)
 			default:
-				panic(fmt.Sprintf("unknown config change cmd type %d", cmd.ConfigChange.ChangeType))
+				panic(fmt.Sprintf("unknown config change cmd type %d", change.ChangeType))
 			}
 		} else if cmd.GetShutdownStore() != nil {
-			s.handleShutdownStore(cmd)
+			// Historical cluster-wide shutdowns must not prevent quorum recovery.
+			continue
 		} else if cmd.GetCreateTaskService() != nil {
 			s.createTaskService(cmd.CreateTaskService)
 			s.createSQLLogger(cmd.CreateTaskService)
@@ -76,6 +109,74 @@ func (s *Service) handleCommands(cmds []pb.ScheduleCommand) {
 			panic(fmt.Sprintf("unknown schedule command type: %+v", cmd))
 		}
 	}
+
+	// Lifecycle work can restore quorum even when a membership operation blocks.
+	// Preserve delivery order among the membership operations themselves.
+	for _, cmd := range cmds {
+		if !isMembershipChange(cmd.ConfigChange) {
+			continue
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		if cmd.ConfigChange.Replica.ShardID == hakeeper.DefaultHAKeeperShardID && s.store.catalogExecutor.enabled {
+			if err := s.store.executeCatalogCommand(ctx, cmd); err != nil {
+				s.runtime.Logger().Error("catalog metadata command rejected", zap.Error(err))
+			}
+			continue
+		}
+		if cmd.UUID != s.ID() {
+			continue
+		}
+		s.runtime.Logger().Info(fmt.Sprintf("%s applying cmd: %s", s.ID(), cmd.LogString()))
+		if ctx.Err() != nil {
+			return
+		}
+		switch cmd.ConfigChange.ChangeType {
+		case pb.AddReplica:
+			s.handleAddReplica(cmd)
+		case pb.AddNonVotingReplica:
+			s.handleAddNonVotingReplica(cmd)
+		case pb.RemoveReplica, pb.RemoveNonVotingReplica:
+			s.handleRemoveReplica(cmd)
+		}
+	}
+}
+
+func isReplicaCleanup(change *pb.ConfigChange) bool {
+	if change == nil {
+		return false
+	}
+	switch change.ChangeType {
+	case pb.StopReplica, pb.StopNonVotingReplica, pb.KillZombie:
+		return true
+	default:
+		return false
+	}
+}
+
+func isMembershipChange(change *pb.ConfigChange) bool {
+	if change == nil {
+		return false
+	}
+	switch change.ChangeType {
+	case pb.AddReplica, pb.AddNonVotingReplica, pb.RemoveReplica, pb.RemoveNonVotingReplica:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Service) canStartLocalReplica(replica pb.Replica) bool {
+	if replica.UUID != s.ID() || s.store.isSkippedZombie(replica.ShardID, replica.ReplicaID) {
+		return false
+	}
+	for _, local := range s.store.getShards() {
+		if local.ShardID == replica.ShardID && local.ReplicaID == replica.ReplicaID && local.Retiring {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Service) handleAddReplica(cmd pb.ScheduleCommand) {
@@ -110,7 +211,7 @@ func (s *Service) handleRemoveReplica(cmd pb.ScheduleCommand) {
 func (s *Service) handleStartReplica(cmd pb.ScheduleCommand) {
 	shardID := cmd.ConfigChange.Replica.ShardID
 	replicaID := cmd.ConfigChange.Replica.ReplicaID
-	join := len(cmd.ConfigChange.InitialMembers) == 0
+	join := len(cmd.ConfigChange.InitialMembers) == 0 && !s.store.nh.HasNodeInfo(shardID, replicaID)
 	if shardID == hakeeper.DefaultHAKeeperShardID {
 		if err := s.store.startHAKeeperReplica(replicaID,
 			cmd.ConfigChange.InitialMembers, join); err != nil {
@@ -127,7 +228,7 @@ func (s *Service) handleStartReplica(cmd pb.ScheduleCommand) {
 func (s *Service) handleStartNonVotingReplica(cmd pb.ScheduleCommand) {
 	shardID := cmd.ConfigChange.Replica.ShardID
 	replicaID := cmd.ConfigChange.Replica.ReplicaID
-	join := len(cmd.ConfigChange.InitialMembers) == 0
+	join := len(cmd.ConfigChange.InitialMembers) == 0 && !s.store.nh.HasNodeInfo(shardID, replicaID)
 	if shardID == hakeeper.DefaultHAKeeperShardID {
 		if err := s.store.startHAKeeperNonVotingReplica(replicaID,
 			cmd.ConfigChange.InitialMembers, join); err != nil {
@@ -177,14 +278,6 @@ func (s *Service) handleKillZombie(cmd pb.ScheduleCommand) {
 		return
 	}
 	s.store.removeMetadata(shardID, replicaID)
-}
-
-func (s *Service) handleShutdownStore(_ pb.ScheduleCommand) {
-	// notify main routine that have received shutdown cmd
-	select {
-	case s.shutdownC <- struct{}{}:
-	default:
-	}
 }
 
 func (s *Service) heartbeatWorker(ctx context.Context) {
@@ -298,5 +391,5 @@ func (s *Service) heartbeat(ctx context.Context) {
 
 	s.config.DecrCount()
 
-	s.handleCommands(cb.Commands)
+	s.handleCommands(ctx, cb.Commands)
 }

@@ -640,7 +640,7 @@ func TestHAKeeperClientConnectByReverseProxy(t *testing.T) {
 				StoreID: "hello world",
 			},
 		}
-		require.NoError(t, s.store.addScheduleCommands(ctx, 0, []pb.ScheduleCommand{sc}))
+		require.NoError(t, s.store.addScheduleCommands(ctx, testHAKeeperTerm(t, s.store), []pb.ScheduleCommand{sc}))
 		cb, err = c.SendLogHeartbeat(ctx, hb)
 		require.NoError(t, err)
 		require.Equal(t, 1, len(cb.Commands))
@@ -746,7 +746,7 @@ func TestHAKeeperClientSendTNHeartbeat(t *testing.T) {
 				StoreID: "hello world",
 			},
 		}
-		require.NoError(t, s.store.addScheduleCommands(ctx, 0, []pb.ScheduleCommand{sc}))
+		require.NoError(t, s.store.addScheduleCommands(ctx, testHAKeeperTerm(t, s.store), []pb.ScheduleCommand{sc}))
 		cb, err = c.SendTNHeartbeat(ctx, hb)
 		require.NoError(t, err)
 		require.Equal(t, 1, len(cb.Commands))
@@ -778,7 +778,7 @@ func TestHAKeeperClientPollScheduleCommands(t *testing.T) {
 			},
 		}
 		require.NoError(t,
-			s.store.addScheduleCommands(ctx, 0, []pb.ScheduleCommand{command}))
+			s.store.addScheduleCommands(ctx, testHAKeeperTerm(t, s.store), []pb.ScheduleCommand{command}))
 
 		batch, err := client.GetScheduleCommands(ctx, pb.TNService)
 		require.NoError(t, err)
@@ -1179,7 +1179,7 @@ func TestHAKeeperClientSendLogHeartbeat(t *testing.T) {
 				StoreID: "hello world",
 			},
 		}
-		require.NoError(t, s.store.addScheduleCommands(ctx, 0, []pb.ScheduleCommand{sc}))
+		require.NoError(t, s.store.addScheduleCommands(ctx, testHAKeeperTerm(t, s.store), []pb.ScheduleCommand{sc}))
 		cb, err = c.SendLogHeartbeat(ctx, hb)
 		require.NoError(t, err)
 		require.Equal(t, 1, len(cb.Commands))

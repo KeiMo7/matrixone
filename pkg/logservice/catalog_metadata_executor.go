@@ -126,8 +126,8 @@ func (l *store) catalogReplicaPresent(p pb.CatalogMetadataStartPermit, ready boo
 // Serializes actual Start/Stop with the durable high-water. Transport timeout
 // never changes the permit. REVOKING is persisted before Stop so a crash cannot
 // restore a canceled STARTING record into a running replica.
-func (l *store) executeCatalogStart(p pb.CatalogMetadataStartPermit) error {
-	return l.executeCatalogStartWith(p, l)
+func (l *store) executeCatalogStart(ctx context.Context, p pb.CatalogMetadataStartPermit) error {
+	return l.executeCatalogStartWith(ctx, p, l)
 }
 
 // The owner accepts a replica controller so persistence and execution failures
@@ -161,14 +161,14 @@ func (l *store) catalogStopReplica(p pb.CatalogMetadataStartPermit) error {
 	return nil
 }
 
-func (l *store) executeCatalogStartWith(p pb.CatalogMetadataStartPermit, host catalogReplicaController) error {
+func (l *store) executeCatalogStartWith(ctx context.Context, p pb.CatalogMetadataStartPermit, host catalogReplicaController) error {
 	c := &l.catalogExecutor
 	c.Lock()
 	defer c.Unlock()
-	return l.executeCatalogStartLocked(p, host)
+	return l.executeCatalogStartLocked(ctx, p, host)
 }
 
-func (l *store) executeCatalogStartLocked(p pb.CatalogMetadataStartPermit, host catalogReplicaController) error {
+func (l *store) executeCatalogStartLocked(ctx context.Context, p pb.CatalogMetadataStartPermit, host catalogReplicaController) error {
 	c := &l.catalogExecutor
 	if !c.enabled || c.failed || p.Token == 0 || p.ReplicaID == 0 || p.UUID != l.cfg.UUID || p.StoreIncarnation == "" || p.StoreIncarnation != l.getStoreIncarnation() || p.Completed {
 		return catalogExecutionError()
@@ -202,6 +202,15 @@ func (l *store) executeCatalogStartLocked(p pb.CatalogMetadataStartPermit, host 
 		if r.Permit.Token != 0 && r.State != "REVOKED" && (r.Permit.ReplicaID != p.ReplicaID || r.Permit.NonVoting != p.NonVoting) {
 			return catalogExecutionError()
 		}
+	}
+	// Recovered work and revocations retain their durable owner. A newly
+	// delivered start must still be admitted after waiting for the supervisor.
+	if !p.Revoked {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	if p.Token > r.Permit.Token {
 		if r.Permit.Token != 0 && r.State == "REVOKED" && r.Permit.ReplicaID != p.ReplicaID {
 			// The retired ID is not an admitted restart candidate for the new
 			// permit. Do not accumulate old HAKeeper metadata across replacements.
@@ -279,7 +288,7 @@ func (l *store) recoverCatalogReplica(replicaID uint64, nonVoting bool) error {
 		if r.State == "REVOKED" || r.State == "REVOKING" {
 			return nil
 		}
-		return l.executeCatalogStartLocked(r.Permit, l)
+		return l.executeCatalogStartLocked(context.Background(), r.Permit, l)
 	}
 	if nonVoting {
 		return l.startHAKeeperNonVotingReplicaRaw(replicaID, nil, false)
@@ -302,7 +311,7 @@ func (l *store) catalogStartHeartbeat() *pb.CatalogMetadataStartPermit {
 		p.Revoked = true
 	}
 	if c.record.State != "REVOKED" {
-		if err := l.executeCatalogStartLocked(p, l); err != nil {
+		if err := l.executeCatalogStartLocked(context.Background(), p, l); err != nil {
 			return nil
 		}
 	}
@@ -474,6 +483,10 @@ func reconcileCatalogMembership(ctx context.Context, expected *pb.CatalogMetadat
 		if !catalogMembershipCanApply(p, m) {
 			return catalogExecutionError()
 		}
+		// A canceled caller must not admit a new Raft mutation.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err := owner.catalogMutateMembership(ctx, p); err != nil {
 			return err
 		}
@@ -497,7 +510,7 @@ func reconcileCatalogMembership(ctx context.Context, expected *pb.CatalogMetadat
 // The schedule command is an internal HAKeeper delivery. New members cannot
 // perform a local SyncRead before StartReplica, so start authorization travels
 // in the durable permit and is fenced locally by the supervisor.
-func (l *store) executeCatalogCommand(cmd pb.ScheduleCommand) error {
+func (l *store) executeCatalogCommand(ctx context.Context, cmd pb.ScheduleCommand) error {
 	cfg := cmd.ConfigChange
 	if cfg == nil || cfg.Replica.ShardID != hakeeper.DefaultHAKeeperShardID || !l.catalogExecutor.enabled {
 		return catalogExecutionError()
@@ -508,7 +521,7 @@ func (l *store) executeCatalogCommand(cmd pb.ScheduleCommand) error {
 		if p == nil || p.ReplicaID != cfg.Replica.ReplicaID || p.UUID != cfg.Replica.UUID || p.ConfigChangeIndex != cfg.Replica.Epoch || p.ChangeType != cfg.ChangeType {
 			return catalogExecutionError()
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 		return l.reconcileCatalogMembership(ctx, p)
 	case pb.StartReplica, pb.StartNonVotingReplica, pb.StopReplica, pb.StopNonVotingReplica, pb.KillZombie:
@@ -520,7 +533,7 @@ func (l *store) executeCatalogCommand(cmd pb.ScheduleCommand) error {
 		if (p.Revoked || p.RevocationPending) != stop || (!stop && (p.NonVoting != (cfg.ChangeType == pb.StartNonVotingReplica) || len(cfg.InitialMembers) != 0)) {
 			return catalogExecutionError()
 		}
-		if err := l.executeCatalogStart(*p); err != nil {
+		if err := l.executeCatalogStart(ctx, *p); err != nil {
 			return err
 		}
 		return nil

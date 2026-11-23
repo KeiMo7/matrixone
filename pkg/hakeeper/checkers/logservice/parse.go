@@ -61,6 +61,7 @@ func fixedLogShardInfoNormal(
 	record metadata.LogShardRecord,
 	info pb.LogShardInfo,
 	expiredStores []string,
+	stores map[string]pb.LogStoreInfo,
 ) *fixingShard {
 	// info.Replicas only contains the normal replicas.
 	// info.NonVotingReplicas only contains the non-voting replicas.
@@ -86,6 +87,25 @@ func fixedLogShardInfoNormal(
 	// The number of replicas is more than expected. Remove some of them.
 	if diff > 0 {
 		idSlice := sortedReplicaID(fixing.replicas, info.LeaderID)
+		// Prefer members that are not reporting their configured voter. Removing
+		// a live voter first could lose the projected majority even when a safe
+		// surplus candidate exists. Preserve the existing leader/ID ordering
+		// among equally available candidates.
+		reported := make(map[uint64]bool, len(idSlice))
+		for _, id := range idSlice {
+			uuid := fixing.replicas[id]
+			reported[id] = !replicaStoreIncarnationChanged(id, uuid, info.ReplicaStoreIncarnations, stores) &&
+				replicaStarted(info.ShardID, id, false, stores[uuid].Replicas)
+		}
+		slices.SortStableFunc(idSlice, func(a, b uint64) int {
+			if reported[a] == reported[b] {
+				return 0
+			}
+			if reported[a] {
+				return 1
+			}
+			return -1
+		})
 		for i := 0; i < diff; i++ {
 			delete(fixing.replicas, idSlice[i])
 		}
@@ -138,8 +158,9 @@ func fixedLogShardInfo(
 	nonVotingReplicaNum uint64,
 	info pb.LogShardInfo,
 	expiredStores []string,
+	stores map[string]pb.LogStoreInfo,
 ) (*fixingShard, *fixingShard) {
-	return fixedLogShardInfoNormal(record, info, expiredStores),
+	return fixedLogShardInfoNormal(record, info, expiredStores, stores),
 		fixedLogShardInfoNonVoting(nonVotingReplicaNum, info, expiredStores)
 }
 
@@ -174,7 +195,9 @@ func getReplicasToStart(
 			continue
 		}
 		store := stores[uuid]
-		if !replicaStarted(shardID, store.Replicas) {
+		// A NodeHost can host only one local instance per shard. A different
+		// reported ID must be stopped before scheduling this one.
+		if !shardReported(shardID, store.Replicas) {
 			rep := replica{
 				uuid:      uuid,
 				shardID:   shardID,
@@ -226,7 +249,7 @@ func parseLogShards(
 	for _, shardInfo := range infos.Shards {
 		shardID := shardInfo.ShardID
 		record := getRecord(shardID, cluster.LogShards)
-		fixingNormal, fixingNonVoting := fixedLogShardInfo(record, nonVotingReplicaNum, shardInfo, expired)
+		fixingNormal, fixingNonVoting := fixedLogShardInfo(record, nonVotingReplicaNum, shardInfo, expired, infos.Stores)
 		removeReplicasOnChangedStoreIncarnation(fixingNormal, shardInfo, infos.Stores)
 		removeReplicasOnChangedStoreIncarnation(fixingNonVoting, shardInfo, infos.Stores)
 
@@ -333,10 +356,19 @@ func sortedReplicaID(replicas map[uint64]string, leaderID uint64) []uint64 {
 	return idSlice
 }
 
-// replicaStarted checks if a replica is started in LogReplicaInfo.
-func replicaStarted(shardID uint64, replicas []pb.LogReplicaInfo) bool {
+func shardReported(shardID uint64, replicas []pb.LogReplicaInfo) bool {
 	for _, r := range replicas {
 		if r.ShardID == shardID {
+			return true
+		}
+	}
+	return false
+}
+
+// replicaStarted checks if a replica is started in LogReplicaInfo.
+func replicaStarted(shardID, replicaID uint64, nonVoting bool, replicas []pb.LogReplicaInfo) bool {
+	for _, r := range replicas {
+		if r.ShardID == shardID && r.ReplicaID == replicaID && r.IsNonVoting == nonVoting {
 			return true
 		}
 	}

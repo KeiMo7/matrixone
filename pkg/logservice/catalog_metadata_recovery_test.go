@@ -15,6 +15,7 @@
 package logservice
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -27,16 +28,16 @@ func TestCatalogRetirementOvertakesFailedRestart(t *testing.T) {
 		t.Run(pending, func(t *testing.T) {
 			s, permit := catalogTestSupervisor(t)
 			host := &catalogTestReplica{ready: true}
-			require.NoError(t, s.executeCatalogStartWith(permit, host))
+			require.NoError(t, s.executeCatalogStartWith(context.Background(), permit, host))
 			if pending == "STARTING" {
 				host.present, host.ready = false, false
 				host.startHook = func() error { return errors.New("restart failed") }
-				require.ErrorContains(t, s.executeCatalogStartWith(permit, host), "restart failed")
+				require.ErrorContains(t, s.executeCatalogStartWith(context.Background(), permit, host), "restart failed")
 			} else {
 				host.stopHook = func() error { return errors.New("stop failed") }
 				revoke := permit
 				revoke.Revoked = true
-				require.ErrorContains(t, s.executeCatalogStartWith(revoke, host), "stop failed")
+				require.ErrorContains(t, s.executeCatalogStartWith(context.Background(), revoke, host), "stop failed")
 			}
 			require.Equal(t, pending, catalogReadRecord(t, s).State)
 			retire := permit
@@ -44,14 +45,14 @@ func TestCatalogRetirementOvertakesFailedRestart(t *testing.T) {
 			retire.Revoked = true
 			wrongIdentity := retire
 			wrongIdentity.ReplicaID++
-			require.Error(t, s.executeCatalogStartWith(wrongIdentity, host))
+			require.Error(t, s.executeCatalogStartWith(context.Background(), wrongIdentity, host))
 			starts := host.starts
 			host.stopHook = nil
-			require.NoError(t, s.executeCatalogStartWith(retire, host))
+			require.NoError(t, s.executeCatalogStartWith(context.Background(), retire, host))
 			require.Equal(t, starts, host.starts, "retirement must not retry the failed start")
 			require.Equal(t, "REVOKED", catalogReadRecord(t, s).State)
 			require.Equal(t, retire.Token, catalogReadRecord(t, s).Permit.Token)
-			require.Error(t, s.executeCatalogStartWith(permit, host))
+			require.Error(t, s.executeCatalogStartWith(context.Background(), permit, host))
 		})
 	}
 }
@@ -59,7 +60,7 @@ func TestCatalogRetirementOvertakesFailedRestart(t *testing.T) {
 func TestCatalogExecutorDoesNotAdvertiseStaleIncarnation(t *testing.T) {
 	s, permit := catalogTestSupervisor(t)
 	host := &catalogTestReplica{ready: true}
-	require.NoError(t, s.executeCatalogStartWith(permit, host))
+	require.NoError(t, s.executeCatalogStartWith(context.Background(), permit, host))
 	require.NotNil(t, s.catalogExecutorCapabilities())
 	s.mu.Lock()
 	s.mu.metadata.Incarnation = "replacement"
@@ -72,15 +73,15 @@ func TestCatalogExecutorReplacementRetiresRestartMetadata(t *testing.T) {
 	s, old := catalogTestSupervisor(t)
 	host := &catalogTestReplica{ready: true}
 	s.addMetadata(hakeeper.DefaultHAKeeperShardID, old.ReplicaID, old.NonVoting)
-	require.NoError(t, s.executeCatalogStartWith(old, host))
+	require.NoError(t, s.executeCatalogStartWith(context.Background(), old, host))
 	revoked := old
 	revoked.Revoked = true
-	require.NoError(t, s.executeCatalogStartWith(revoked, host))
+	require.NoError(t, s.executeCatalogStartWith(context.Background(), revoked, host))
 	next := old
 	next.Token++
 	next.ReplicaID++
 	host.ready = true
-	require.NoError(t, s.executeCatalogStartWith(next, host))
+	require.NoError(t, s.executeCatalogStartWith(context.Background(), next, host))
 	require.Empty(t, s.getShards(), "a retired ID must not remain an admitted restart candidate")
 	require.Equal(t, next.ReplicaID, catalogReadRecord(t, s).Permit.ReplicaID)
 	// The durable supervised identity, not leftover pre-cutover metadata,
