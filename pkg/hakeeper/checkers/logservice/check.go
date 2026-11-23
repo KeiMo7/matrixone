@@ -221,7 +221,6 @@ func (ca *checkToAdd) check() []*operator.Operator {
 	var ops []*operator.Operator
 	checkFn := func(
 		toAdd map[uint64]uint32,
-		adding map[uint64][]uint64,
 		createFn func(
 			uuid string,
 			shardInfo pb.LogShardInfo,
@@ -240,15 +239,11 @@ func (ca *checkToAdd) check() []*operator.Operator {
 			if ca.membershipChangeInFlight(shardID) {
 				continue
 			}
-			replicasToAdd := toAdd[shardID]
 			numOfLogReplicas := getNumOfLogReplicas(ca.lc.Cluster.LogShards, shardID)
 			if numOfLogReplicas == 0 || uint64(normalStats.toAdd[shardID]) == numOfLogReplicas {
 				continue
 			}
 			shardInfo := ca.lc.logState.Shards[shardID]
-			if replicasToAdd <= uint32(len(adding[shardID])) {
-				continue
-			}
 			bestStore := selectStore(shardInfo, ca.lc.workingStores, locality)
 			if bestStore == "" {
 				runtime.ServiceRuntime(ca.lc.ServiceID).Logger().Error(
@@ -275,9 +270,6 @@ func (ca *checkToAdd) check() []*operator.Operator {
 				continue
 			}
 			ops = append(ops, op)
-			if ca.membershipScheduled == nil {
-				ca.membershipScheduled = make(map[uint64]struct{})
-			}
 			ca.membershipScheduled[shardID] = struct{}{}
 		}
 	}
@@ -286,14 +278,12 @@ func (ca *checkToAdd) check() []*operator.Operator {
 		fn := operator.CreateAddReplica
 		locality := pb.Locality{}
 		changeType := pb.AddReplica
-		adding := ca.lc.executing.Adding
 		if s.nonVoting {
 			fn = operator.CreateAddNonVotingReplica
-			adding = ca.lc.executingNonVoting.Adding
 			locality = ca.lc.nonVotingLocality
 			changeType = pb.AddNonVotingReplica
 		}
-		checkFn(s.toAdd, adding, fn, changeType, locality)
+		checkFn(s.toAdd, fn, changeType, locality)
 	}
 
 	return ops
@@ -307,7 +297,6 @@ func (cr *checkToRemove) check() []*operator.Operator {
 	var ops []*operator.Operator
 	checkFn := func(
 		toRemove map[uint64][]replica,
-		removing map[uint64][]uint64,
 		changeType pb.ConfigChangeType,
 		createFn func(uuid string, shardInfo pb.LogShardInfo, executorCandidates []string) (*operator.Operator, error),
 	) {
@@ -328,8 +317,7 @@ func (cr *checkToRemove) check() []*operator.Operator {
 				})
 			}
 			for _, toRemoveReplica := range replicasToRemove {
-				if contains(removing[shardID], toRemoveReplica.replicaID) ||
-					replicaIsStarting(cr.lc.executing, cr.lc.executingNonVoting, shardID, toRemoveReplica.replicaID) {
+				if replicaIsStarting(cr.lc.executing, cr.lc.executingNonVoting, shardID, toRemoveReplica.replicaID) {
 					continue
 				}
 				executorCandidates := hakeeper.LogMembershipTargets(cr.lc.Cfg, cr.lc.logState, cr.lc.CurrentTick, changeType,
@@ -344,13 +332,7 @@ func (cr *checkToRemove) check() []*operator.Operator {
 					continue
 				}
 				ops = append(ops, op)
-				if cr.membershipScheduled == nil {
-					cr.membershipScheduled = make(map[uint64]struct{})
-				}
 				cr.membershipScheduled[shardID] = struct{}{}
-				if cr.removing == nil {
-					cr.removing = make(map[operator.Replica]bool)
-				}
 				cr.removing[operator.Replica{UUID: toRemoveReplica.uuid, ShardID: shardID, ReplicaID: toRemoveReplica.replicaID}] = true
 				break
 			}
@@ -358,14 +340,12 @@ func (cr *checkToRemove) check() []*operator.Operator {
 	}
 	for _, s := range cr.ss {
 		fn := operator.CreateRemoveReplica
-		removing := cr.lc.executing.Removing
 		changeType := pb.RemoveReplica
 		if s.nonVoting {
 			fn = operator.CreateRemoveNonVotingReplica
-			removing = cr.lc.executingNonVoting.Removing
 			changeType = pb.RemoveNonVotingReplica
 		}
-		checkFn(s.toRemove, removing, changeType, fn)
+		checkFn(s.toRemove, changeType, fn)
 	}
 
 	return ops

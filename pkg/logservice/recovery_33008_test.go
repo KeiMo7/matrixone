@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"os"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
@@ -29,6 +30,18 @@ import (
 	pb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
 	"github.com/stretchr/testify/require"
 )
+
+func useRecoveryRPCSocket(t *testing.T, cfg *Config) {
+	t.Helper()
+	// Unix socket paths have a small length limit, even with a long TMPDIR.
+	dir, err := os.MkdirTemp("/tmp", "mo-log-")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+	addr := "unix://" + filepath.Join(dir, "rpc.sock")
+	cfg.LogServicePort = 0
+	cfg.ServiceListenAddress = addr
+	cfg.ServiceAddress = addr
+}
 
 // A real disk-backed three-store Raft group. The retired store never returns:
 // a surviving store must reopen its existing replica from an actual command.
@@ -65,6 +78,7 @@ func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 	seeds := make([]string, 0, len(configs))
 	for i := range configs {
 		configs[i] = getServiceTestConfig()
+		useRecoveryRPCSocket(t, &configs[i])
 		// Keep election timeouts above the scheduling delays seen in a race suite.
 		configs[i].RTTMillisecond = 100
 		configs[i].DataDir = t.TempDir()
@@ -79,7 +93,7 @@ func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 		configs[i].GossipSeedAddresses = seeds
 		configs[i].HAKeeperClientConfig.ServiceAddresses = nil
 		for j := range configs {
-			configs[i].HAKeeperClientConfig.ServiceAddresses = append(configs[i].HAKeeperClientConfig.ServiceAddresses, getTestServiceAddress(configs[j].LogServicePort))
+			configs[i].HAKeeperClientConfig.ServiceAddresses = append(configs[i].HAKeeperClientConfig.ServiceAddresses, configs[j].LogServiceServiceAddr())
 		}
 	}
 	open := func(i int) {
@@ -376,6 +390,7 @@ func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 
 func TestNonVotingStartReopensDisk(t *testing.T) {
 	cfg := getServiceTestConfig()
+	useRecoveryRPCSocket(t, &cfg)
 	cfg.DataDir = t.TempDir()
 	cfg.SnapshotExportDir = filepath.Join(cfg.DataDir, "exported-snapshot")
 	cfg.FS = vfs.Default

@@ -156,11 +156,6 @@ func newStoreSet() *storeSet {
 	}
 }
 
-// length returns number of all stores within this set.
-func (s *storeSet) length() int {
-	return len(s.working) + len(s.expired)
-}
-
 // parseLogState separates log stores as expired and working.
 func parseLogState(cfg hakeeper.Config, logState pb.LogState, currTick uint64) *storeSet {
 	set := newStoreSet()

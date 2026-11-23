@@ -1182,7 +1182,7 @@ func TestMembershipChangesWaitForVotingMajority(t *testing.T) {
 				logState:            state,
 				workingStores:       map[string]pb.Locality{"a": {}, "b": {}, "d": {}, "e": {}},
 			}
-			common := checker{lc: lc, ss: []*stats{normal, nonVoting}, membershipScheduled: make(map[uint64]struct{})}
+			common := checker{lc: lc, ss: []*stats{normal, nonVoting}, membershipScheduled: make(map[uint64]struct{}), removing: make(map[operator.Replica]bool)}
 			assert.Empty(t, (&checkToAdd{checker: common}).check())
 			assert.Empty(t, (&checkToRemove{checker: common}).check())
 			startOps := (&checkToStart{checker: common}).check()

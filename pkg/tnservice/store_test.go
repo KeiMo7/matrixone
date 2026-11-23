@@ -557,7 +557,6 @@ func newTestStore(
 		c,
 		rt,
 		fs,
-		nil,
 		options...)
 	assert.NoError(t, err)
 	return s.(*store)

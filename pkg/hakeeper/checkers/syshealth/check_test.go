@@ -50,7 +50,7 @@ func TestParseLogStores(t *testing.T) {
 	}
 
 	logStores := parseLogState(cfg, logState, currTick)
-	require.Equal(t, len(logState.Stores), logStores.length())
+	require.Equal(t, len(logState.Stores), len(logStores.working)+len(logStores.expired))
 	require.Equal(t, 1, len(logStores.expired))
 	require.Equal(t, 2, len(logStores.working))
 }
