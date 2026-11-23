@@ -26,7 +26,7 @@ import (
 // does not mean that an old configuration or storage incarnation is still valid.
 func PendingOperators(fields hakeeper.CheckerCommonFields, state pb.LogState,
 	executing, executingNonVoting operator.ExecutingReplicas,
-	nonVotingReplicaNum uint64, ops, newOps []*operator.Operator) []*operator.Operator {
+	nonVotingReplicaNum uint64, ops []*operator.Operator) []*operator.Operator {
 	working, expired := parseLogStores(fields.Cfg, state, fields.CurrentTick)
 	normal, nonVoting := parseLogShards(fields.Cluster, state, expired, nonVotingReplicaNum)
 	starts := [2]map[operator.Replica]bool{}
@@ -51,24 +51,6 @@ func PendingOperators(fields hakeeper.CheckerCommonFields, state pb.LogState,
 	}
 	live := func(uuid string) bool { _, ok := working[uuid]; return ok }
 	membershipScheduled := make(map[uint64]struct{})
-	selectedRemovals := make(map[operator.Replica]bool)
-	for _, op := range newOps {
-		if op == nil {
-			continue
-		}
-		for _, step := range op.OpSteps() {
-			var replica operator.Replica
-			switch step := step.(type) {
-			case operator.RemoveLogService:
-				replica = step.Replica
-			case operator.RemoveNonVotingLogService:
-				replica = step.Replica
-			default:
-				continue
-			}
-			selectedRemovals[operator.Replica{ShardID: replica.ShardID, ReplicaID: replica.ReplicaID}] = true
-		}
-	}
 	authorized := func(r operator.Replica, target string, change pb.ConfigChangeType) bool {
 		member := pb.Replica{UUID: r.UUID, ShardID: r.ShardID, ReplicaID: r.ReplicaID, Epoch: r.Epoch}
 		return slices.Contains(hakeeper.LogMembershipTargets(fields.Cfg, state, fields.CurrentTick, change, member), target)
@@ -94,9 +76,7 @@ func PendingOperators(fields hakeeper.CheckerCommonFields, state pb.LogState,
 			change = pb.RemoveNonVotingReplica
 		}
 		if replicaIsStarting(executing, executingNonVoting, r.ShardID, r.ReplicaID) {
-			// The previous removal may already be in flight. Do not resend
-			// either side of the conflict while both operators are owned.
-			selectedRemovals[operator.Replica{ShardID: r.ShardID, ReplicaID: r.ReplicaID}] = true
+			// A previous Start may still be in flight.
 			return false
 		}
 		if _, scheduled := membershipScheduled[r.ShardID]; scheduled ||
@@ -104,11 +84,9 @@ func PendingOperators(fields hakeeper.CheckerCommonFields, state pb.LogState,
 			return false
 		}
 		membershipScheduled[r.ShardID] = struct{}{}
-		selectedRemovals[operator.Replica{ShardID: r.ShardID, ReplicaID: r.ReplicaID}] = true
 		return true
 	}
 	var pending []*operator.Operator
-	startsByOperator := make(map[*operator.Operator]operator.Replica)
 	seen := make(map[*operator.Operator]bool, len(ops))
 	for _, op := range ops {
 		if op == nil || seen[op] {
@@ -135,11 +113,11 @@ func PendingOperators(fields hakeeper.CheckerCommonFields, state pb.LogState,
 		eligible := false
 		switch step := step.(type) {
 		case operator.StartLogService:
-			eligible = live(step.UUID) && starts[0][step.Replica]
-			startsByOperator[op] = step.Replica
+			eligible = live(step.UUID) && starts[0][step.Replica] &&
+				!replicaIsRemoving(executing, executingNonVoting, step.ShardID, step.ReplicaID)
 		case operator.StartNonVotingLogService:
-			eligible = live(step.UUID) && starts[1][step.Replica]
-			startsByOperator[op] = step.Replica
+			eligible = live(step.UUID) && starts[1][step.Replica] &&
+				!replicaIsRemoving(executing, executingNonVoting, step.ShardID, step.ReplicaID)
 		case operator.AddLogService:
 			eligible = add(0, step.Replica, step.Target)
 		case operator.AddNonVotingLogService:
@@ -150,16 +128,12 @@ func PendingOperators(fields hakeeper.CheckerCommonFields, state pb.LogState,
 			eligible = remove(1, step.Replica, step.Target)
 		case operator.BootstrapShard:
 			key := operator.Replica{UUID: step.UUID, ShardID: step.ShardID, ReplicaID: step.ReplicaID}
-			eligible = live(step.UUID) && (bootstrap[step.ShardID] || starts[0][key])
-			startsByOperator[op] = key
+			eligible = live(step.UUID) && (bootstrap[step.ShardID] || starts[0][key]) &&
+				!replicaIsRemoving(executing, executingNonVoting, step.ShardID, step.ReplicaID)
 		}
 		if eligible {
 			pending = append(pending, op)
 		}
 	}
-	return slices.DeleteFunc(pending, func(op *operator.Operator) bool {
-		replica, isStart := startsByOperator[op]
-		return isStart && (replicaIsRemoving(executing, executingNonVoting, replica.ShardID, replica.ReplicaID) ||
-			selectedRemovals[operator.Replica{ShardID: replica.ShardID, ReplicaID: replica.ReplicaID}])
-	})
+	return pending
 }

@@ -900,13 +900,18 @@ func TestCoordinatorRetainsIssuedRemovalWithoutStart(t *testing.T) {
 					second := c.Check(alloc, state, false)
 					require.Equal(t, operator.STARTED, owner.Status())
 					require.Contains(t, c.OperatorController.GetOperators(1), owner)
+					startedExecutor := false
 					for _, cmd := range second {
+						if cmd.ConfigChange != nil && cmd.ConfigChange.ChangeType == pb.StartReplica && cmd.UUID == removal.UUID {
+							startedExecutor = true
+						}
 						if cmd.ConfigChange != nil && cmd.ConfigChange.Replica.ReplicaID == 4 {
 							require.NotEqual(t, pb.StartReplica, cmd.ConfigChange.ChangeType)
 							require.NotEqual(t, pb.StartNonVotingReplica, cmd.ConfigChange.ChangeType)
 							require.NotEqual(t, change, cmd.ConfigChange.ChangeType, "an unreporting executor cannot retry")
 						}
 					}
+					require.True(t, startedExecutor, "the owned removal must not stall an independent replica")
 					state.LogState.Stores[removal.UUID] = executor
 					restored := c.Check(alloc, state, false)
 					if retryTN {
@@ -973,7 +978,24 @@ func TestCoordinatorBootstrapOwnsReplicaStart(t *testing.T) {
 	for _, cmd := range second {
 		if cmd.ConfigChange != nil && cmd.ConfigChange.Replica.ReplicaID == missing.BootstrapShard.ReplicaID {
 			require.NotEqual(t, pb.StartReplica, cmd.ConfigChange.ChangeType, "an in-flight bootstrap already owns this local start")
+		}
+	}
+	// Even when the missing member becomes surplus, its in-flight bootstrap
+	// owns the local start until a report or expiry releases it.
+	state.ClusterInfo.LogShards[0].NumberOfReplicas = 2
+	for _, cmd := range c.Check(alloc, state, false) {
+		if cmd.ConfigChange != nil && cmd.ConfigChange.Replica.ReplicaID == missing.BootstrapShard.ReplicaID {
 			require.NotEqual(t, pb.RemoveReplica, cmd.ConfigChange.ChangeType)
 		}
 	}
+	store := state.LogState.Stores[missing.UUID]
+	store.Replicas = []pb.LogReplicaInfo{{LogShardInfo: shard, ReplicaID: missing.BootstrapShard.ReplicaID}}
+	state.LogState.Stores[missing.UUID] = store
+	removed := false
+	for _, cmd := range c.Check(alloc, state, false) {
+		if cmd.ConfigChange != nil && cmd.ConfigChange.ChangeType == pb.RemoveReplica {
+			removed = true
+		}
+	}
+	require.True(t, removed, "removal resumes after bootstrap is reported")
 }

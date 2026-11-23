@@ -71,8 +71,13 @@ func TestPendingRemovalWaitsForInFlightStart(t *testing.T) {
 					}
 				}
 			}
+			if nonVoting {
+				observers.Removing = map[uint64][]uint64{1: {5}}
+			} else {
+				voting.Removing = map[uint64][]uint64{1: {5}}
+			}
 			for _, ops := range [][]*operator.Operator{{start, remove}, {remove, start}} {
-				got := PendingOperators(fields, state, voting, observers, 0, ops, nil)
+				got := PendingOperators(fields, state, voting, observers, 0, ops)
 				require.Empty(t, got, "neither previously delivered command is safe to resend")
 			}
 			oldReplica := replica
@@ -83,9 +88,9 @@ func TestPendingRemovalWaitsForInFlightStart(t *testing.T) {
 			} else {
 				oldRemove = operator.NewOperator("", 1, 7, operator.RemoveLogService{Target: "a", Replica: oldReplica})
 			}
-			require.Empty(t, PendingOperators(fields, state, voting, observers, 0, []*operator.Operator{start, oldRemove}, nil),
+			require.Empty(t, PendingOperators(fields, state, voting, observers, 0, []*operator.Operator{start, oldRemove}),
 				"conflicts use shard and replica ID even if an old command has another UUID")
-			got := PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, []*operator.Operator{remove}, nil)
+			got := PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, []*operator.Operator{remove})
 			require.Equal(t, []*operator.Operator{remove}, got, "removal resumes when no Start is tracked")
 			if !nonVoting {
 				shard.Replicas[4] = "d"
@@ -94,7 +99,8 @@ func TestPendingRemovalWaitsForInFlightStart(t *testing.T) {
 				other := operator.NewOperator("", 1, 7, operator.RemoveLogService{
 					Target: "a", Replica: operator.Replica{UUID: "d", ShardID: 1, ReplicaID: 4, Epoch: 7},
 				})
-				got = PendingOperators(fields, state, voting, observers, 0, []*operator.Operator{start, other}, nil)
+				onlyStarting := operator.ExecutingReplicas{Starting: map[uint64][]uint64{1: {5}}}
+				got = PendingOperators(fields, state, onlyStarting, operator.ExecutingReplicas{}, 0, []*operator.Operator{start, other})
 				require.ElementsMatch(t, []*operator.Operator{start, other}, got,
 					"a Start must not block a different safe removal")
 			}
@@ -155,7 +161,7 @@ func TestPendingOperatorsFollowCurrentLogCandidates(t *testing.T) {
 			}
 			fields := hakeeper.NewCheckerCommonFields("", cfg, nil, pb.ClusterInfo{LogShards: []metadata.LogShardRecord{{ShardID: 1, NumberOfReplicas: uint64(tt.normal)}}}, pb.TaskTableUser{}, tick)
 			op := operator.NewOperator("", 1, 1, tt.step)
-			got := PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, uint64(tt.nonVoting), []*operator.Operator{nil, op, op}, nil)
+			got := PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, uint64(tt.nonVoting), []*operator.Operator{nil, op, op})
 			if tt.want {
 				require.Equal(t, []*operator.Operator{op}, got)
 			} else {
@@ -163,7 +169,7 @@ func TestPendingOperatorsFollowCurrentLogCandidates(t *testing.T) {
 			}
 			for _, terminal := range []operator.OpStatus{operator.SUCCESS, operator.CANCELED, operator.EXPIRED} {
 				op.SetStatus(terminal)
-				require.Empty(t, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, uint64(tt.nonVoting), []*operator.Operator{op}, nil))
+				require.Empty(t, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, uint64(tt.nonVoting), []*operator.Operator{op}))
 			}
 		})
 	}
@@ -184,7 +190,7 @@ func TestPendingAddSlotsAndStepProgress(t *testing.T) {
 	start := operator.StartLogService{Replica: operator.Replica{UUID: "d", ShardID: 1, ReplicaID: 4}}
 	op := operator.NewOperator("", 1, 1, add, start)
 	extra := operator.NewOperator("", 1, 1, operator.AddLogService{Target: "a", Replica: operator.Replica{UUID: "e", ShardID: 1, ReplicaID: 5, Epoch: 1}})
-	require.Equal(t, []*operator.Operator{op}, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, []*operator.Operator{op, extra}, nil))
+	require.Equal(t, []*operator.Operator{op}, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, []*operator.Operator{op, extra}))
 	controller := operator.NewController()
 	cmds := controller.Dispatch([]*operator.Operator{op}, state, pb.TNState{}, pb.CNState{}, pb.ProxyState{})
 	require.Equal(t, pb.AddReplica, cmds[0].ConfigChange.ChangeType)
@@ -192,13 +198,13 @@ func TestPendingAddSlotsAndStepProgress(t *testing.T) {
 	shard.Replicas[4] = "d"
 	shard.Epoch = 2
 	state.Shards[1] = shard
-	require.Equal(t, []*operator.Operator{op}, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, []*operator.Operator{op, extra}, nil))
+	require.Equal(t, []*operator.Operator{op}, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, []*operator.Operator{op, extra}))
 	cmds = controller.Dispatch([]*operator.Operator{op}, state, pb.TNState{}, pb.CNState{}, pb.ProxyState{})
 	require.Equal(t, pb.StartReplica, cmds[0].ConfigChange.ChangeType)
 	store := state.Stores["d"]
 	store.Replicas = []pb.LogReplicaInfo{{LogShardInfo: shard, ReplicaID: 4}}
 	state.Stores["d"] = store
-	require.Empty(t, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, []*operator.Operator{op}, nil))
+	require.Empty(t, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, []*operator.Operator{op}))
 	require.Equal(t, operator.SUCCESS, op.Status())
 }
 
@@ -228,16 +234,16 @@ func TestPendingMembershipRetryRequiresReportingExecutor(t *testing.T) {
 	store := state.Stores["a"]
 	store.Replicas = nil
 	state.Stores["a"] = store
-	require.Empty(t, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, []*operator.Operator{addOnA}, nil))
+	require.Empty(t, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, []*operator.Operator{addOnA}))
 
 	// Replacing it with a current reporter restores retry, and a sibling change
 	// for the same shard and epoch is withheld until the first is observed.
 	otherAdd := operator.NewOperator("", 1, 1, operator.AddLogService{
 		Target: "b", Replica: operator.Replica{UUID: "g", ShardID: 1, ReplicaID: 7, Epoch: 1},
 	})
-	require.Equal(t, []*operator.Operator{addOnB}, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, []*operator.Operator{addOnB}, nil))
-	require.Equal(t, []*operator.Operator{otherAdd}, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, []*operator.Operator{otherAdd}, nil))
-	require.Equal(t, []*operator.Operator{addOnB}, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, []*operator.Operator{addOnB, otherAdd}, nil))
+	require.Equal(t, []*operator.Operator{addOnB}, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, []*operator.Operator{addOnB}))
+	require.Equal(t, []*operator.Operator{otherAdd}, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, []*operator.Operator{otherAdd}))
+	require.Equal(t, []*operator.Operator{addOnB}, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, []*operator.Operator{addOnB, otherAdd}))
 }
 
 func TestPendingVotingRemovalSelectsSafeSurplus(t *testing.T) {
@@ -263,38 +269,12 @@ func TestPendingVotingRemovalSelectsSafeSurplus(t *testing.T) {
 	}
 	safe := remove(4, 7)
 	require.Equal(t, []*operator.Operator{safe}, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0,
-		[]*operator.Operator{remove(2, 7), remove(5, 6), safe, remove(5, 7)}, nil))
+		[]*operator.Operator{remove(2, 7), remove(5, 6), safe, remove(5, 7)}))
 
 	store := state.Stores["c"]
 	store.Replicas = nil
 	state.Stores["c"] = store
-	require.Empty(t, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, []*operator.Operator{safe}, nil))
-}
-
-func TestPendingStartDoesNotConflictWithNewRemoval(t *testing.T) {
-	cfg := hakeeper.Config{}
-	cfg.Fill()
-	fields := hakeeper.NewCheckerCommonFields("", cfg, nil,
-		pb.ClusterInfo{LogShards: []metadata.LogShardRecord{{ShardID: 1, NumberOfReplicas: 3}}},
-		pb.TaskTableUser{}, 1)
-	shard := pb.LogShardInfo{ShardID: 1, Epoch: 7, LeaderID: 1,
-		Replicas: map[uint64]string{1: "a", 2: "b", 3: "c", 4: "d", 5: "e"}}
-	state := pb.LogState{Shards: map[uint64]pb.LogShardInfo{1: shard}, Stores: map[string]pb.LogStoreInfo{}}
-	for id, uuid := range shard.Replicas {
-		store := pb.LogStoreInfo{Tick: 1}
-		if id <= 3 {
-			store.Replicas = []pb.LogReplicaInfo{{LogShardInfo: shard, ReplicaID: id}}
-		}
-		state.Stores[uuid] = store
-	}
-	startD := operator.CreateStartReplica("", "d", 1, 4)
-	startE := operator.CreateStartReplica("", "e", 1, 5)
-	removeD := operator.NewOperator("", 1, 7, operator.RemoveLogService{
-		Target: "a", Replica: operator.Replica{UUID: "d", ShardID: 1, ReplicaID: 4, Epoch: 7},
-	})
-	got := PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, []*operator.Operator{startD, startE}, []*operator.Operator{removeD})
-	require.Equal(t, []*operator.Operator{startE}, got,
-		"suppress the selected removal only, not the other missing voter")
+	require.Empty(t, PendingOperators(fields, state, operator.ExecutingReplicas{}, operator.ExecutingReplicas{}, 0, []*operator.Operator{safe}))
 }
 
 func TestPendingStartWaitsForOwnedRemoval(t *testing.T) {
@@ -327,10 +307,10 @@ func TestPendingStartWaitsForOwnedRemoval(t *testing.T) {
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
 			empty := operator.ExecutingReplicas{}
-			require.Equal(t, []*operator.Operator{tt.op}, PendingOperators(fields, state, empty, empty, 1, []*operator.Operator{tt.op}, nil))
+			require.Equal(t, []*operator.Operator{tt.op}, PendingOperators(fields, state, empty, empty, 1, []*operator.Operator{tt.op}))
 			reservation := operator.ExecutingReplicas{Removing: map[uint64][]uint64{1: {tt.id}}}
-			require.Empty(t, PendingOperators(fields, state, reservation, empty, 1, []*operator.Operator{tt.op}, nil))
-			require.Empty(t, PendingOperators(fields, state, empty, reservation, 1, []*operator.Operator{tt.op}, nil))
+			require.Empty(t, PendingOperators(fields, state, reservation, empty, 1, []*operator.Operator{tt.op}))
+			require.Empty(t, PendingOperators(fields, state, empty, reservation, 1, []*operator.Operator{tt.op}))
 		})
 	}
 }

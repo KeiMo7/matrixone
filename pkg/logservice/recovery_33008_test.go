@@ -64,19 +64,25 @@ func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 	}
 	connect := func(s *Service) LogHAKeeperClient {
 		t.Helper()
-		var client LogHAKeeperClient
-		require.Eventually(t, func() bool {
-			attempt, stop := context.WithTimeout(ctx, time.Second)
-			defer stop()
-			candidate, err := NewLogHAKeeperClient(attempt, s.ID(), configs[2].GetHAKeeperClientConfig())
-			if err != nil {
-				return false
+		connectCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		ticker := time.NewTicker(50 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			attempt, stop := context.WithTimeout(connectCtx, time.Second)
+			client, err := NewLogHAKeeperClient(attempt, s.ID(), configs[2].GetHAKeeperClientConfig())
+			stop()
+			if err == nil {
+				t.Cleanup(func() { require.NoError(t, client.Close()) })
+				return client
 			}
-			client = candidate
-			return true
-		}, 10*time.Second, 50*time.Millisecond)
-		t.Cleanup(func() { require.NoError(t, client.Close()) })
-		return client
+			select {
+			case <-connectCtx.Done():
+				t.Fatalf("cannot connect to HAKeeper: %v", err)
+				return nil
+			case <-ticker.C:
+			}
+		}
 	}
 	for i := range configs {
 		open(i)

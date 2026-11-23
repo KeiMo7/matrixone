@@ -110,7 +110,7 @@ func (c *Coordinator) Check(alloc util.IDAllocator, state pb.CheckerState, stand
 		for _, shardID := range slices.Compact(shardIDs) {
 			existing = append(existing, c.OperatorController.GetOperators(shardID)...)
 		}
-		pending := logservice.PendingOperators(commonFields, logState, executing, executingNonVoting, state.NonVotingReplicaNum, existing, operators)
+		pending := logservice.PendingOperators(commonFields, logState, executing, executingNonVoting, state.NonVotingReplicaNum, existing)
 		operators = append(pending, operators...)
 	}
 	return c.OperatorController.Dispatch(operators, logState, tnState, cnState, proxyState)
