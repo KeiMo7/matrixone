@@ -75,12 +75,9 @@ func (c *Coordinator) Check(alloc util.IDAllocator, state pb.CheckerState, stand
 		user,
 		currentTick,
 	)
+	c.removeStaleLogMembershipOperators(state)
 	executing := c.OperatorController.GetExecutingReplicas()
 	executingNonVoting := c.OperatorController.GetNonVotingExecutingReplicas()
-	if c.removeStaleLogMembershipOperators(state, executing, executingNonVoting) {
-		executing = c.OperatorController.GetExecutingReplicas()
-		executingNonVoting = c.OperatorController.GetNonVotingExecutingReplicas()
-	}
 
 	operators := make([]*operator.Operator, 0)
 	checkers := []hakeeper.ModuleChecker{
@@ -119,9 +116,7 @@ func (c *Coordinator) Check(alloc util.IDAllocator, state pb.CheckerState, stand
 	return c.OperatorController.Dispatch(operators, logState, tnState, cnState, proxyState)
 }
 
-func (c *Coordinator) removeStaleLogMembershipOperators(
-	state pb.CheckerState, executing, executingNonVoting operator.ExecutingReplicas,
-) bool {
+func (c *Coordinator) removeStaleLogMembershipOperators(state pb.CheckerState) {
 	var stale []*operator.Operator
 	for shardID := range state.LogState.Shards {
 		for _, op := range c.OperatorController.GetOperators(shardID) {
@@ -133,16 +128,14 @@ func (c *Coordinator) removeStaleLogMembershipOperators(
 			if !ok {
 				continue
 			}
+			if (change == pb.RemoveReplica || change == pb.RemoveNonVotingReplica) &&
+				state.LogState.Shards[shardID].Epoch <= replica.Epoch {
+				// The command may already be in flight even if its executor stops
+				// reporting. Keep ownership until completion, expiry or an epoch fence.
+				continue
+			}
 			member := pb.Replica{UUID: replica.UUID, ShardID: replica.ShardID, ReplicaID: replica.ReplicaID, Epoch: replica.Epoch}
 			if !slices.Contains(hakeeper.LogMembershipTargets(c.cfg, state.LogState, state.Tick, change, member), target) {
-				if (change == pb.RemoveReplica || change == pb.RemoveNonVotingReplica) &&
-					state.LogState.Shards[shardID].Epoch == replica.Epoch &&
-					(slices.Contains(executing.Starting[shardID], replica.ReplicaID) ||
-						slices.Contains(executingNonVoting.Starting[shardID], replica.ReplicaID)) {
-					// The Remove may already be submitted. Keep its owner until
-					// it finishes, expires, or an advanced epoch fences it.
-					continue
-				}
 				stale = append(stale, op)
 			}
 		}
@@ -150,7 +143,6 @@ func (c *Coordinator) removeStaleLogMembershipOperators(
 	for _, op := range stale {
 		c.OperatorController.RemoveOperator(op)
 	}
-	return len(stale) != 0
 }
 
 func logMembershipStep(step operator.OpStep) (operator.Replica, string, pb.ConfigChangeType, bool) {

@@ -30,7 +30,7 @@ import (
 
 // Builder is used to create operators. Usage:
 //
-//	op, err := NewBuilder(desc, cluster, shard).
+//	op, err := NewBuilder(desc, shard, candidates).
 //	            RemovePeer(store1).
 //	            AddPeer(peer1).
 //	            Build(kind)
@@ -65,11 +65,16 @@ type Builder struct {
 }
 
 // NewBuilder creates a Builder.
-func NewBuilder(desc string, shardInfo logservice.LogShardInfo) *Builder {
+func NewBuilder(desc string, shardInfo logservice.LogShardInfo, candidates []string) *Builder {
 	b := &Builder{
 		desc:    desc,
 		shardID: shardInfo.ShardID,
 		epoch:   shardInfo.Epoch,
+	}
+
+	b.executorCandidates = make(map[string]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		b.executorCandidates[candidate] = struct{}{}
 	}
 
 	// origin peers
@@ -228,14 +233,6 @@ func (b *Builder) prepareBuild() string {
 	return b.brief()
 }
 
-func (b *Builder) withExecutorCandidates(candidates []string) *Builder {
-	b.executorCandidates = make(map[string]struct{}, len(candidates))
-	for _, candidate := range candidates {
-		b.executorCandidates[candidate] = struct{}{}
-	}
-	return b
-}
-
 func (b *Builder) selectRetainedVotingTarget() (string, error) {
 	var selected string
 	found := false
@@ -244,10 +241,8 @@ func (b *Builder) selectRetainedVotingTarget() (string, error) {
 		if !retained || originReplicaID != replicaID {
 			continue
 		}
-		if b.executorCandidates != nil {
-			if _, eligible := b.executorCandidates[target]; !eligible {
-				continue
-			}
+		if _, eligible := b.executorCandidates[target]; !eligible {
+			continue
 		}
 		if !found || target < selected {
 			selected, found = target, true

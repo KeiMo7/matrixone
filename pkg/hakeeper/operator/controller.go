@@ -94,6 +94,7 @@ func (c *Controller) GetExecutingReplicas() ExecutingReplicas {
 					executing.Starting[shardID] = append(executing.Starting[shardID], step.ReplicaID)
 				case BootstrapShard:
 					executing.Bootstrapping[shardID] = struct{}{}
+					executing.Starting[shardID] = append(executing.Starting[shardID], step.ReplicaID)
 				}
 			}
 		}
@@ -124,39 +125,22 @@ func (c *Controller) GetNonVotingExecutingReplicas() ExecutingReplicas {
 	return executing
 }
 
-func (c *Controller) GetExecutingNonVotingReplicas() ExecutingReplicas {
-	executing := ExecutingReplicas{
-		Adding:   make(map[uint64][]uint64),
-		Removing: make(map[uint64][]uint64),
-		Starting: make(map[uint64][]uint64),
-	}
-	for shardID, operators := range c.operators {
-		for _, op := range operators {
-			for _, step := range op.steps {
-				switch step := step.(type) {
-				case RemoveLogService:
-					executing.Removing[shardID] = append(executing.Removing[shardID], step.ReplicaID)
-				case AddLogService:
-					executing.Adding[shardID] = append(executing.Adding[shardID], step.ReplicaID)
-				case StartLogService:
-					executing.Starting[shardID] = append(executing.Starting[shardID], step.ReplicaID)
-				}
-			}
-		}
-	}
-	return executing
-}
-
 func (c *Controller) RemoveFinishedOperator(
 	logState pb.LogState, tnState pb.TNState, cnState pb.CNState, proxyState pb.ProxyState,
 ) {
-	for _, ops := range c.operators {
+	for shardID, ops := range c.operators {
+		remaining := ops[:0]
 		for _, op := range ops {
 			op.Check(logState, tnState, cnState, proxyState)
-			switch op.Status() {
-			case SUCCESS, EXPIRED:
-				c.RemoveOperator(op)
+			if !op.IsEnd() {
+				remaining = append(remaining, op)
 			}
+		}
+		clear(ops[len(remaining):])
+		if len(remaining) == 0 {
+			delete(c.operators, shardID)
+		} else {
+			c.operators[shardID] = remaining
 		}
 	}
 }

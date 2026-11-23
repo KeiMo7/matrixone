@@ -159,6 +159,7 @@ func PendingOperators(fields hakeeper.CheckerCommonFields, state pb.LogState,
 	}
 	return slices.DeleteFunc(pending, func(op *operator.Operator) bool {
 		replica, isStart := startsByOperator[op]
-		return isStart && selectedRemovals[operator.Replica{ShardID: replica.ShardID, ReplicaID: replica.ReplicaID}]
+		return isStart && (replicaIsRemoving(executing, executingNonVoting, replica.ShardID, replica.ReplicaID) ||
+			selectedRemovals[operator.Replica{ShardID: replica.ShardID, ReplicaID: replica.ReplicaID}])
 	})
 }

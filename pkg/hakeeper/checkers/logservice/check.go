@@ -108,6 +108,11 @@ func replicaIsStarting(voting, nonVoting operator.ExecutingReplicas, shardID, re
 		slices.Contains(nonVoting.Starting[shardID], replicaID)
 }
 
+func replicaIsRemoving(voting, nonVoting operator.ExecutingReplicas, shardID, replicaID uint64) bool {
+	return slices.Contains(voting.Removing[shardID], replicaID) ||
+		slices.Contains(nonVoting.Removing[shardID], replicaID)
+}
+
 // checkToBootstrap is different with checkToAdd. checkToBootstrap checks
 // if there are some start replicas with initial members, in which case,
 // there are no the original replicas.
@@ -278,16 +283,12 @@ func (ca *checkToAdd) check() []*operator.Operator {
 	}
 
 	for _, s := range ca.ss {
-		fn := func(uuid string, shardInfo pb.LogShardInfo, replicaID uint64, candidates []string) (*operator.Operator, error) {
-			return operator.CreateAddReplicaWithCandidates(uuid, shardInfo, replicaID, candidates)
-		}
+		fn := operator.CreateAddReplica
 		locality := pb.Locality{}
 		changeType := pb.AddReplica
 		adding := ca.lc.executing.Adding
 		if s.nonVoting {
-			fn = func(uuid string, shardInfo pb.LogShardInfo, replicaID uint64, candidates []string) (*operator.Operator, error) {
-				return operator.CreateAddNonVotingReplicaWithCandidates(uuid, shardInfo, replicaID, candidates)
-			}
+			fn = operator.CreateAddNonVotingReplica
 			adding = ca.lc.executingNonVoting.Adding
 			locality = ca.lc.nonVotingLocality
 			changeType = pb.AddNonVotingReplica
@@ -356,15 +357,11 @@ func (cr *checkToRemove) check() []*operator.Operator {
 		}
 	}
 	for _, s := range cr.ss {
-		fn := func(uuid string, shardInfo pb.LogShardInfo, candidates []string) (*operator.Operator, error) {
-			return operator.CreateRemoveReplicaWithCandidates(uuid, shardInfo, candidates)
-		}
+		fn := operator.CreateRemoveReplica
 		removing := cr.lc.executing.Removing
 		changeType := pb.RemoveReplica
 		if s.nonVoting {
-			fn = func(uuid string, shardInfo pb.LogShardInfo, candidates []string) (*operator.Operator, error) {
-				return operator.CreateRemoveNonVotingReplicaWithCandidates(uuid, shardInfo, candidates)
-			}
+			fn = operator.CreateRemoveNonVotingReplica
 			removing = cr.lc.executingNonVoting.Removing
 			changeType = pb.RemoveNonVotingReplica
 		}
@@ -390,8 +387,7 @@ func (cs *checkToStart) check() []*operator.Operator {
 				continue
 			}
 			key := operator.Replica{UUID: replicaToStart.uuid, ShardID: replicaToStart.shardID, ReplicaID: replicaToStart.replicaID}
-			if cs.removing[key] || contains(cs.lc.executing.Removing[key.ShardID], key.ReplicaID) ||
-				contains(cs.lc.executingNonVoting.Removing[key.ShardID], key.ReplicaID) {
+			if cs.removing[key] || replicaIsRemoving(cs.lc.executing, cs.lc.executingNonVoting, key.ShardID, key.ReplicaID) {
 				continue
 			}
 			ops = append(ops, createFn(

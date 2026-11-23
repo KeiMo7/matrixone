@@ -15,6 +15,7 @@
 package checkers
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -835,5 +836,144 @@ func TestCoordinatorReplansUnconsumedMembershipAfterExpiry(t *testing.T) {
 			removal.SetStatus(operator.EXPIRED)
 			require.Equal(t, !tc.recovered, hasRemoval(c.Check(alloc, state, false)), "retry must follow the current desired state")
 		})
+	}
+}
+
+func TestCoordinatorRetainsIssuedRemovalWithoutStart(t *testing.T) {
+	for _, nonVoting := range []bool{false, true} {
+		for _, retryTN := range []bool{false, true} {
+			for _, release := range []string{"committed", "epoch", "expired"} {
+				name := fmt.Sprintf("nonVoting=%t/tnRetry=%t/%s", nonVoting, retryTN, release)
+				t.Run(name, func(t *testing.T) {
+					c, state, alloc := tnStartScenario(t)
+					if !retryTN {
+						state.ClusterInfo.TNShards = nil
+						state.TNState = pb.TNState{}
+					}
+					shard := pb.LogShardInfo{ShardID: 1, Epoch: 7, Replicas: map[uint64]string{1: "a", 2: "b", 3: "c"}}
+					change := pb.RemoveReplica
+					if nonVoting {
+						shard.NonVotingReplicas = map[uint64]string{4: "d"}
+						change = pb.RemoveNonVotingReplica
+					} else {
+						shard.Replicas[4] = "d"
+					}
+					state.ClusterInfo.LogShards = []metadata.LogShardRecord{{ShardID: 1, NumberOfReplicas: 3}}
+					state.LogState = pb.LogState{Shards: map[uint64]pb.LogShardInfo{1: shard}, Stores: map[string]pb.LogStoreInfo{"d": {Tick: 1, TaskServiceCreated: true}}}
+					for id, uuid := range map[uint64]string{1: "a", 2: "b", 3: "c"} {
+						state.LogState.Stores[uuid] = pb.LogStoreInfo{Tick: 1, TaskServiceCreated: true, Replicas: []pb.LogReplicaInfo{{LogShardInfo: shard, ReplicaID: id}}}
+					}
+					first := c.Check(alloc, state, false)
+					var removal *pb.ScheduleCommand
+					for i := range first {
+						if first[i].ConfigChange != nil && first[i].ConfigChange.ChangeType == change {
+							removal = &first[i]
+							break
+						}
+					}
+					require.NotNil(t, removal, "the first scheduling round must issue the removal")
+					require.Equal(t, uint64(4), removal.ConfigChange.Replica.ReplicaID)
+					var owner *operator.Operator
+					for _, op := range c.OperatorController.GetOperators(1) {
+						for _, step := range op.OpSteps() {
+							switch step := step.(type) {
+							case operator.RemoveLogService:
+								if step.ReplicaID == 4 {
+									owner = op
+								}
+							case operator.RemoveNonVotingLogService:
+								if step.ReplicaID == 4 {
+									owner = op
+								}
+							case operator.StartLogService:
+								require.NotEqual(t, uint64(4), step.ReplicaID)
+							case operator.StartNonVotingLogService:
+								require.NotEqual(t, uint64(4), step.ReplicaID)
+							}
+						}
+					}
+					require.NotNil(t, owner)
+					executor := state.LogState.Stores[removal.UUID]
+					unreported := executor
+					unreported.Replicas = nil
+					state.LogState.Stores[removal.UUID] = unreported
+					second := c.Check(alloc, state, false)
+					require.Equal(t, operator.STARTED, owner.Status())
+					require.Contains(t, c.OperatorController.GetOperators(1), owner)
+					for _, cmd := range second {
+						if cmd.ConfigChange != nil && cmd.ConfigChange.Replica.ReplicaID == 4 {
+							require.NotEqual(t, pb.StartReplica, cmd.ConfigChange.ChangeType)
+							require.NotEqual(t, pb.StartNonVotingReplica, cmd.ConfigChange.ChangeType)
+							require.NotEqual(t, change, cmd.ConfigChange.ChangeType, "an unreporting executor cannot retry")
+						}
+					}
+					state.LogState.Stores[removal.UUID] = executor
+					restored := c.Check(alloc, state, false)
+					if retryTN {
+						require.Contains(t, restored, *removal, "TN retries may replay a still-authorized removal")
+					}
+					switch release {
+					case "committed":
+						delete(shard.Replicas, 4)
+						delete(shard.NonVotingReplicas, 4)
+						shard.Epoch++
+						state.LogState.Shards[1] = shard
+					case "epoch":
+						shard.Epoch++
+						state.LogState.Shards[1] = shard
+					case "expired":
+						owner.SetStatus(operator.EXPIRED)
+					}
+					c.Check(alloc, state, false)
+					require.NotContains(t, c.OperatorController.GetOperators(1), owner)
+					if release == "committed" {
+						require.Equal(t, operator.SUCCESS, owner.Status())
+					} else if release == "epoch" {
+						require.Equal(t, operator.CANCELED, owner.Status())
+					} else {
+						require.Equal(t, operator.EXPIRED, owner.Status())
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestCoordinatorBootstrapOwnsReplicaStart(t *testing.T) {
+	c := NewCoordinator("", hakeeper.Config{})
+	alloc := util.NewTestIDAllocator(100)
+	state := pb.CheckerState{Tick: 1,
+		ClusterInfo: pb.ClusterInfo{LogShards: []metadata.LogShardRecord{{ShardID: 1, NumberOfReplicas: 3}}},
+		LogState: pb.LogState{Shards: map[uint64]pb.LogShardInfo{1: {ShardID: 1, Replicas: map[uint64]string{}}}, Stores: map[string]pb.LogStoreInfo{
+			"a": {Tick: 1, TaskServiceCreated: true}, "b": {Tick: 1, TaskServiceCreated: true}, "c": {Tick: 1, TaskServiceCreated: true},
+		}},
+	}
+	first := c.Check(alloc, state, false)
+	var bootstrap []pb.ScheduleCommand
+	for _, cmd := range first {
+		if cmd.BootstrapShard != nil {
+			bootstrap = append(bootstrap, cmd)
+		}
+	}
+	require.Len(t, bootstrap, 3, "the first real scheduling round must bootstrap all replicas")
+	shard := pb.LogShardInfo{ShardID: 1, Epoch: 1, Replicas: bootstrap[0].BootstrapShard.InitialMembers}
+	state.LogState.Shards[1] = shard
+	var missing pb.ScheduleCommand
+	for i, cmd := range bootstrap {
+		if i == 0 {
+			missing = cmd
+			continue
+		}
+		store := state.LogState.Stores[cmd.UUID]
+		store.Replicas = []pb.LogReplicaInfo{{LogShardInfo: shard, ReplicaID: cmd.BootstrapShard.ReplicaID}}
+		state.LogState.Stores[cmd.UUID] = store
+	}
+	second := c.Check(alloc, state, false)
+	t.Logf("unreported bootstrap store=%s id=%d commands=%+v", missing.UUID, missing.BootstrapShard.ReplicaID, second)
+	for _, cmd := range second {
+		if cmd.ConfigChange != nil && cmd.ConfigChange.Replica.ReplicaID == missing.BootstrapShard.ReplicaID {
+			require.NotEqual(t, pb.StartReplica, cmd.ConfigChange.ChangeType, "an in-flight bootstrap already owns this local start")
+			require.NotEqual(t, pb.RemoveReplica, cmd.ConfigChange.ChangeType)
+		}
 	}
 }

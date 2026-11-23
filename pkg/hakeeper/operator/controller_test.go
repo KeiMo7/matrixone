@@ -121,3 +121,21 @@ func TestDispatchMixedRetryPreservesPointerOwnership(t *testing.T) {
 	assert.Len(t, got, 1)
 	assert.Equal(t, EXPIRED, log.Status())
 }
+
+func TestRemoveFinishedOperatorCompactsAdjacentEntries(t *testing.T) {
+	c := NewController()
+	finished := NewOperator("", 1, 1, RemoveLogService{Replica: Replica{ShardID: 1, ReplicaID: 4}})
+	expired := NewOperator("", 1, 1, RemoveLogService{Replica: Replica{ShardID: 1, ReplicaID: 5}})
+	canceled := NewOperator("", 1, 1, RemoveLogService{Replica: Replica{ShardID: 1, ReplicaID: 6}})
+	active := NewOperator("", 1, 1, RemoveLogService{Replica: Replica{ShardID: 1, ReplicaID: 7}})
+	state := pb.LogState{Shards: map[uint64]pb.LogShardInfo{1: {Replicas: map[uint64]string{5: "e", 6: "f", 7: "g"}}}}
+	c.operators[1] = []*Operator{finished, expired, canceled, active}
+	expired.SetStatus(EXPIRED)
+	canceled.Cancel()
+	c.RemoveFinishedOperator(state, pb.TNState{}, pb.CNState{}, pb.ProxyState{})
+	assert.Equal(t, SUCCESS, finished.Status())
+	assert.Equal(t, EXPIRED, expired.Status())
+	assert.Equal(t, CANCELED, canceled.Status())
+	assert.Equal(t, []*Operator{active}, c.GetOperators(1))
+	assert.Equal(t, []uint64{7}, c.GetExecutingReplicas().Removing[1])
+}

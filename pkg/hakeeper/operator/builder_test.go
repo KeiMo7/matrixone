@@ -27,12 +27,21 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+// Existing builder cases assume that every configured voter is reporting.
+func newTestBuilder(shard logservice.LogShardInfo) *Builder {
+	candidates := make([]string, 0, len(shard.Replicas))
+	for _, uuid := range shard.Replicas {
+		candidates = append(candidates, uuid)
+	}
+	return NewBuilder("", shard, candidates)
+}
+
 func TestAddReplica(t *testing.T) {
 	logShard := logservice.LogShardInfo{ShardID: 1, Replicas: map[uint64]string{1: "a", 2: "b", 3: "c"}, Epoch: 1}
-	assert.NoError(t, NewBuilder("", logShard).AddPeer("d", 4).err)
-	assert.Error(t, NewBuilder("", logShard).AddPeer("", 4).err)
-	assert.Error(t, NewBuilder("", logShard).AddPeer("c", 4).err)
-	assert.Error(t, NewBuilder("", logShard).AddPeer("d", 3).err)
+	assert.NoError(t, newTestBuilder(logShard).AddPeer("d", 4).err)
+	assert.Error(t, newTestBuilder(logShard).AddPeer("", 4).err)
+	assert.Error(t, newTestBuilder(logShard).AddPeer("c", 4).err)
+	assert.Error(t, newTestBuilder(logShard).AddPeer("d", 3).err)
 }
 
 func TestAddNonVotingReplica(t *testing.T) {
@@ -53,16 +62,16 @@ func TestAddNonVotingReplica(t *testing.T) {
 		},
 		Epoch: 1,
 	}
-	assert.NoError(t, NewBuilder("", logShard).AddNonVotingPeer("g", 7).err)
-	assert.Error(t, NewBuilder("", logShard).AddNonVotingPeer("", 7).err)
-	assert.Error(t, NewBuilder("", logShard).AddNonVotingPeer("f", 6).err)
-	assert.Error(t, NewBuilder("", logShard).AddNonVotingPeer("g", 6).err)
+	assert.NoError(t, newTestBuilder(logShard).AddNonVotingPeer("g", 7).err)
+	assert.Error(t, newTestBuilder(logShard).AddNonVotingPeer("", 7).err)
+	assert.Error(t, newTestBuilder(logShard).AddNonVotingPeer("f", 6).err)
+	assert.Error(t, newTestBuilder(logShard).AddNonVotingPeer("g", 6).err)
 }
 
 func TestRemoveReplica(t *testing.T) {
 	logShard := logservice.LogShardInfo{ShardID: 1, Replicas: map[uint64]string{1: "a", 2: "b", 3: "c"}, Epoch: 1}
-	assert.NoError(t, NewBuilder("", logShard).RemovePeer("c").err)
-	assert.Error(t, NewBuilder("", logShard).RemovePeer("d").err)
+	assert.NoError(t, newTestBuilder(logShard).RemovePeer("c").err)
+	assert.Error(t, newTestBuilder(logShard).RemovePeer("d").err)
 }
 
 func TestRemoveNonVotingReplica(t *testing.T) {
@@ -83,20 +92,20 @@ func TestRemoveNonVotingReplica(t *testing.T) {
 		},
 		Epoch: 1,
 	}
-	assert.NoError(t, NewBuilder("", logShard).RemoveNonVotingPeer("f").err)
-	assert.Error(t, NewBuilder("", logShard).RemoveNonVotingPeer("g").err)
+	assert.NoError(t, newTestBuilder(logShard).RemoveNonVotingPeer("f").err)
+	assert.Error(t, newTestBuilder(logShard).RemoveNonVotingPeer("g").err)
 }
 
 func TestAddBuild(t *testing.T) {
 	logShard := logservice.LogShardInfo{ShardID: 1, Replicas: map[uint64]string{1: "a", 2: "b", 3: "c"}, Epoch: 1}
 
-	_, err := NewBuilder("", logShard).Build()
+	_, err := newTestBuilder(logShard).Build()
 	assert.Error(t, err)
 
-	_, err = NewBuilder("", logShard).AddPeer("", 4).Build()
+	_, err = newTestBuilder(logShard).AddPeer("", 4).Build()
 	assert.Error(t, err)
 
-	build, err := NewBuilder("", logShard).AddPeer("d", 4).Build()
+	build, err := newTestBuilder(logShard).AddPeer("d", 4).Build()
 	assert.NoError(t, err)
 	assert.Equal(t, "add peer: store [d]", build.brief)
 	assert.Equal(t, uint64(1), build.shardID)
@@ -130,13 +139,13 @@ func TestAddNonVotingBuild(t *testing.T) {
 		},
 		Epoch: 1,
 	}
-	_, err := NewBuilder("", logShard).Build()
+	_, err := newTestBuilder(logShard).Build()
 	assert.Error(t, err)
 
-	_, err = NewBuilder("", logShard).AddNonVotingPeer("", 7).Build()
+	_, err = newTestBuilder(logShard).AddNonVotingPeer("", 7).Build()
 	assert.Error(t, err)
 
-	build, err := NewBuilder("", logShard).AddNonVotingPeer("g", 7).Build()
+	build, err := newTestBuilder(logShard).AddNonVotingPeer("g", 7).Build()
 	assert.NoError(t, err)
 	assert.Equal(t, "add non-voting peer: store [g]", build.brief)
 	assert.Equal(t, uint64(1), build.shardID)
@@ -155,16 +164,16 @@ func TestAddNonVotingBuild(t *testing.T) {
 func TestRemoveBuild(t *testing.T) {
 	logShard := logservice.LogShardInfo{ShardID: 1, Replicas: map[uint64]string{1: "a", 2: "b", 3: "c"}, Epoch: 1}
 
-	_, err := NewBuilder("", logShard).Build()
+	_, err := newTestBuilder(logShard).Build()
 	assert.Error(t, err)
 
-	_, err = NewBuilder("", logShard).RemovePeer("").Build()
+	_, err = newTestBuilder(logShard).RemovePeer("").Build()
 	assert.Error(t, err)
 
-	_, err = NewBuilder("", logShard).RemovePeer("d").Build()
+	_, err = newTestBuilder(logShard).RemovePeer("d").Build()
 	assert.Error(t, err)
 
-	build, err := NewBuilder("", logShard).RemovePeer("c").Build()
+	build, err := newTestBuilder(logShard).RemovePeer("c").Build()
 	assert.NoError(t, err)
 	assert.Equal(t, "rm peer: store [c]", build.brief)
 	assert.Equal(t, uint64(1), build.shardID)
@@ -199,16 +208,16 @@ func TestRemoveNonVotingBuild(t *testing.T) {
 		Epoch: 1,
 	}
 
-	_, err := NewBuilder("", logShard).Build()
+	_, err := newTestBuilder(logShard).Build()
 	assert.Error(t, err)
 
-	_, err = NewBuilder("", logShard).RemoveNonVotingPeer("").Build()
+	_, err = newTestBuilder(logShard).RemoveNonVotingPeer("").Build()
 	assert.Error(t, err)
 
-	_, err = NewBuilder("", logShard).RemoveNonVotingPeer("g").Build()
+	_, err = newTestBuilder(logShard).RemoveNonVotingPeer("g").Build()
 	assert.Error(t, err)
 
-	build, err := NewBuilder("", logShard).RemoveNonVotingPeer("f").Build()
+	build, err := newTestBuilder(logShard).RemoveNonVotingPeer("f").Build()
 	assert.NoError(t, err)
 	assert.Equal(t, "rm non-voting peer: store [f]", build.brief)
 	assert.Equal(t, uint64(1), build.shardID)
@@ -233,8 +242,7 @@ func TestBuildUsesLiveExecutorCandidates(t *testing.T) {
 		},
 	}
 	candidates := []string{"c", "d", "e"}
-	op, err := NewBuilder("", shard).
-		withExecutorCandidates(candidates).
+	op, err := NewBuilder("", shard, candidates).
 		RemovePeer("a").RemovePeer("b").Build()
 	assert.NoError(t, err)
 	if assert.NotNil(t, op) {
@@ -256,7 +264,7 @@ func TestBuildUsesLiveExecutorCandidates(t *testing.T) {
 
 func TestBuildWithoutRetainedExecutorFailsSafely(t *testing.T) {
 	shard := logservice.LogShardInfo{ShardID: 1, Epoch: 7, Replicas: map[uint64]string{1: "a"}}
-	op, err := NewBuilder("", shard).RemovePeer("a").Build()
+	op, err := NewBuilder("", shard, []string{"a"}).RemovePeer("a").Build()
 	assert.ErrorContains(t, err, "without a retained voting peer")
 	assert.Nil(t, op)
 }
@@ -267,7 +275,9 @@ func TestBuildRejectsEmptyExecutorCandidates(t *testing.T) {
 		Epoch:    7,
 		Replicas: map[uint64]string{1: "a", 2: "b"},
 	}
-	op, err := CreateRemoveReplicaWithCandidates("a", shard, []string{})
-	assert.ErrorContains(t, err, "without a retained voting peer")
-	assert.Nil(t, op)
+	for _, candidates := range [][]string{nil, {}} {
+		op, err := CreateRemoveReplica("a", shard, candidates)
+		assert.ErrorContains(t, err, "without a retained voting peer")
+		assert.Nil(t, op)
+	}
 }

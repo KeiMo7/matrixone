@@ -296,3 +296,41 @@ func TestPendingStartDoesNotConflictWithNewRemoval(t *testing.T) {
 	require.Equal(t, []*operator.Operator{startE}, got,
 		"suppress the selected removal only, not the other missing voter")
 }
+
+func TestPendingStartWaitsForOwnedRemoval(t *testing.T) {
+	cfg := hakeeper.Config{}
+	cfg.Fill()
+	fields := hakeeper.NewCheckerCommonFields("", cfg, nil,
+		pb.ClusterInfo{LogShards: []metadata.LogShardRecord{{ShardID: 1, NumberOfReplicas: 3}}},
+		pb.TaskTableUser{}, 1)
+	shard := pb.LogShardInfo{ShardID: 1, Epoch: 7, LeaderID: 1,
+		Replicas:          map[uint64]string{1: "a", 2: "b", 3: "c", 4: "d"},
+		NonVotingReplicas: map[uint64]string{5: "e"}}
+	state := pb.LogState{Shards: map[uint64]pb.LogShardInfo{1: shard}, Stores: map[string]pb.LogStoreInfo{}}
+	for id, uuid := range shard.Replicas {
+		store := pb.LogStoreInfo{Tick: 1}
+		if id <= 3 {
+			store.Replicas = []pb.LogReplicaInfo{{LogShardInfo: shard, ReplicaID: id}}
+		}
+		state.Stores[uuid] = store
+	}
+	state.Stores["e"] = pb.LogStoreInfo{Tick: 1}
+	cases := []struct {
+		name string
+		id   uint64
+		op   *operator.Operator
+	}{
+		{"voting", 4, operator.CreateStartReplica("", "d", 1, 4)},
+		{"nonvoting", 5, operator.CreateStartNonVotingReplica("", "e", 1, 5)},
+		{"bootstrap", 4, operator.CreateBootstrapShard("", "d", 1, 4, shard.Replicas)},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			empty := operator.ExecutingReplicas{}
+			require.Equal(t, []*operator.Operator{tt.op}, PendingOperators(fields, state, empty, empty, 1, []*operator.Operator{tt.op}, nil))
+			reservation := operator.ExecutingReplicas{Removing: map[uint64][]uint64{1: {tt.id}}}
+			require.Empty(t, PendingOperators(fields, state, reservation, empty, 1, []*operator.Operator{tt.op}, nil))
+			require.Empty(t, PendingOperators(fields, state, empty, reservation, 1, []*operator.Operator{tt.op}, nil))
+		})
+	}
+}

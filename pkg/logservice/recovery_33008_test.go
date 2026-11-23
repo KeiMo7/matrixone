@@ -16,6 +16,8 @@ package logservice
 
 import (
 	"context"
+	"fmt"
+	"maps"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
@@ -137,13 +139,58 @@ func TestRecoverExistingReplicaWithoutRetiredStore(t *testing.T) {
 	require.Error(t, a.store.stopReplica(0, localHAID+100))
 	require.Equal(t, localHAID, atomic.LoadUint64(&a.store.haKeeperReplicaID), "a failed stop must not clear the live HAKeeper ID")
 	client := connect(c)
-	for _, service := range services {
-		_, err := client.SendLogHeartbeat(ctx, service.store.getHeartbeatMessage())
-		require.NoError(t, err)
+	// Before installing test commands, wait for a stable leader and committed
+	// reports from all data voters. A successful client connection alone does
+	// not imply that the first heartbeat can be committed.
+	readyCtx, readyCancel := context.WithTimeout(ctx, 12*time.Second)
+	readyTicker := time.NewTicker(50 * time.Millisecond)
+	for {
+		var readyErr error
+		for _, service := range services {
+			attempt, stop := context.WithTimeout(readyCtx, time.Second)
+			_, readyErr = client.SendLogHeartbeat(attempt, service.store.getHeartbeatMessage())
+			stop()
+			if readyErr != nil {
+				break
+			}
+		}
+		if readyErr == nil {
+			attempt, stop := context.WithTimeout(readyCtx, time.Second)
+			state, err := client.GetClusterState(attempt)
+			stop()
+			readyErr = err
+			if readyErr == nil && !maps.Equal(members, state.LogState.Shards[1].Replicas) {
+				readyErr = fmt.Errorf("unexpected data membership: %v", state.LogState.Shards[1].Replicas)
+			}
+			if readyErr == nil {
+				for id, uuid := range members {
+					found := false
+					for _, replica := range state.LogState.Stores[uuid].Replicas {
+						if replica.ShardID == 1 && replica.ReplicaID == id && !replica.IsNonVoting {
+							found = true
+							break
+						}
+					}
+					if !found {
+						readyErr = fmt.Errorf("missing data voter %d on %s", id, uuid)
+						break
+					}
+				}
+			}
+		}
+		if readyErr == nil {
+			break
+		}
+		select {
+		case <-readyCtx.Done():
+			readyTicker.Stop()
+			readyCancel()
+			t.Fatalf("initial committed data heartbeats did not become ready: %v", readyErr)
+		case <-readyTicker.C:
+		}
 	}
-	state, err := client.GetClusterState(ctx)
-	require.NoError(t, err)
-	require.Equal(t, members, state.LogState.Shards[1].Replicas)
+	readyTicker.Stop()
+	readyCancel()
 	old, err := a.store.nh.SyncPropose(ctx, a.store.nh.GetNoOPSession(1), getTestUserEntry())
 	require.NoError(t, err)
 
